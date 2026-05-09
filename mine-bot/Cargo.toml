@@ -6,8 +6,10 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
 dropshot = "0.12"
 serde = { version = "1", features = ["derive"] }
+serde_conl = "0.7"
 serde_json = "1"
 schemars = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "signal", "time"] }

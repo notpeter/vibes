@@ -16,14 +16,40 @@ Rust Dropshot service + Telegram adapter for fetching social post media using `y
 
 ## Run
 ```bash
-cp config.example.toml config.toml
-# edit config.toml
-cargo run
+cp config.example.conl config.conl
+# edit config.conl
+cargo run -- api
 ```
 
-Config is loaded from `MINE_BOT_CONFIG` (default: `config.toml`).
+Default config path is `config.conl`. Override it with `-c/--config`.
 
-Default bind address is `0.0.0.0:53211`.
+Config format is auto-detected as JSON when the first non-empty, non-`//` line starts with `{`. Otherwise it is parsed as CONL.
+
+Default bind address is `127.0.0.1:53211`.
+
+API port selection order is:
+1. `-p/--port`
+2. `PORT`
+3. `../conf/ports.conl` entry for `mine-bot`
+4. built-in fallback `53211`
+
+`default` in `../conf/ports.conl` is documentation only and is not read at runtime.
+
+API host selection order is:
+1. `--host`
+2. `HOST`
+3. built-in fallback `127.0.0.1`
+
+## Config CLI
+```bash
+cargo run -- config schema
+cargo run -- config check
+cargo run -- config json
+cargo run -- config list
+cargo run -- config get telegram.enabled
+cargo run -- config get --all
+cargo run -- config set telegram.enabled true
+```
 
 ## API
 `POST /download`

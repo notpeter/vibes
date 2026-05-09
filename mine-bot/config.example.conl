@@ -1,0 +1,14 @@
+// mine-bot configuration
+bind_address = 127.0.0.1:53211
+database_path = ./mine-bot.sqlite
+download_dir = ./downloads
+
+telegram
+  enabled = false
+  bot_token = "123456:replace-me"
+
+seed_users
+  =
+    platform = telegram
+    platform_user_id = 111111111
+    role = admin
