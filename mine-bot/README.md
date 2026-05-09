@@ -1,6 +1,6 @@
 # mine-bot
 
-Rust Dropshot service + Telegram adapter for fetching social post media using `yt-dlp`.
+Rust Telegram bot for fetching social post media using `yt-dlp`.
 
 ## Features
 - Accepts URL input and downloads media/post metadata.
@@ -8,6 +8,7 @@ Rust Dropshot service + Telegram adapter for fetching social post media using `y
 - Returns post description + media (single video or grouped images in Telegram).
 - Stores users and media metadata in SQLite.
 - Seeds user roles (`admin|user|none`) from config at startup.
+- Uses the shared `download_media()` path directly instead of exposing an HTTP API.
 
 ## Requirements
 - Linux
@@ -18,27 +19,14 @@ Rust Dropshot service + Telegram adapter for fetching social post media using `y
 ```bash
 cargo run -- config init
 # edit config.conl
-cargo run -- api
+cargo run -- run
 ```
 
 Default config path is `config.conl`. Override it with `-c/--config`.
 
 Config format is auto-detected as JSON when the first non-empty line that is not a CONL `;` comment or JSONC `//` comment starts with `{`. Otherwise it is parsed as CONL. JSON inputs support whole-line `//` comments.
 
-Default bind address is `127.0.0.1:53211`.
-
-API port selection order is:
-1. `-p/--port`
-2. `PORT`
-3. `../conf/ports.conl` entry for `mine-bot`
-4. built-in fallback `53211`
-
-`default` in `../conf/ports.conl` is documentation only and is not read at runtime.
-
-API host selection order is:
-1. `--host`
-2. `HOST`
-3. built-in fallback `127.0.0.1`
+The runtime currently requires `telegram.enabled = true`; otherwise startup fails because no direct adapter is enabled.
 
 Telegram token selection order is:
 1. `TELEGRAM_BOT_TOKEN`
@@ -55,12 +43,3 @@ cargo run -- config get telegram.enabled
 cargo run -- config get --all
 cargo run -- config set telegram.enabled true
 ```
-
-## API
-`POST /download`
-
-```json
-{ "url": "https://example.com/post" }
-```
-
-Returns media DB id, normalized URL, post text, and produced files.

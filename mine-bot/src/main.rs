@@ -1,7 +1,5 @@
 use std::{
-    collections::BTreeMap,
     fs,
-    net::{IpAddr, SocketAddr},
     path::PathBuf,
     process::Stdio,
     sync::Arc,
@@ -12,10 +10,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use dropshot::{
-    endpoint, ApiDescription, ConfigDropshot, HttpError, HttpResponseCreated, HttpServerStarter,
-    RequestContext, TypedBody,
-};
 use rusqlite::{params, Connection};
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -25,7 +19,7 @@ use teloxide::{
     types::{InputFile, InputMedia, InputMediaPhoto},
 };
 use tokio::{process::Command as TokioCommand, task};
-use tracing::{error, info};
+use tracing::info;
 use url::Url;
 use uuid::Uuid;
 
@@ -41,12 +35,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    Api {
-        #[arg(long = "host")]
-        host: Option<String>,
-        #[arg(short = 'p', long = "port")]
-        port: Option<u16>,
-    },
+    Run,
     Config {
         #[command(subcommand)]
         command: ConfigSubcommand,
@@ -86,8 +75,6 @@ struct LoadedConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
-    #[serde(default = "default_bind_address")]
-    bind_address: String,
     #[serde(default = "default_database_path")]
     #[schemars(with = "String")]
     database_path: Utf8PathBuf,
@@ -103,7 +90,6 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bind_address: default_bind_address(),
             database_path: default_database_path(),
             download_dir: default_download_dir(),
             telegram: TelegramConfig::default(),
@@ -145,19 +131,7 @@ impl UserRole {
     }
 }
 
-#[derive(Debug, Clone)]
-struct AppState {
-    config: Config,
-}
-
-type AppCtx = Arc<AppState>;
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct DownloadRequest {
-    url: String,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 struct DownloadResponse {
     media_id: i64,
     normalized_url: String,
@@ -171,14 +145,7 @@ enum PathSegment {
     Index(usize),
 }
 
-const DEFAULT_API_PORT: u16 = 53211;
-const DEFAULT_API_HOST: &str = "127.0.0.1";
-const SHARED_PORTS_PATH: &str = "../conf/ports.conl";
 const CONFIG_TEMPLATE: &str = include_str!("../templates/config.conl");
-
-fn default_bind_address() -> String {
-    format!("{DEFAULT_API_HOST}:{DEFAULT_API_PORT}")
-}
 
 fn default_database_path() -> Utf8PathBuf {
     Utf8PathBuf::from("./mine-bot.sqlite")
@@ -193,128 +160,36 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        CliCommand::Api { host, port } => {
+        CliCommand::Run => {
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
                 .init();
-            run_api(cli.config, host, port).await
+            run_bot(cli.config).await
         }
         CliCommand::Config { command } => run_config_command(&cli.config, command),
     }
 }
 
-async fn run_api(
-    config_path: Utf8PathBuf,
-    cli_host: Option<String>,
-    cli_port: Option<u16>,
-) -> Result<()> {
+async fn run_bot(config_path: Utf8PathBuf) -> Result<()> {
     let mut config = load_config(&config_path)?.config;
     apply_env_overrides(&mut config);
-    let bind_address = resolve_bind_address(cli_host, cli_port)?;
 
     fs::create_dir_all(&config.download_dir)?;
     init_db(&config)?;
 
-    let app = Arc::new(AppState {
-        config: config.clone(),
-    });
-
-    if config.telegram.enabled {
-        let tg_state = app.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_telegram(tg_state).await {
-                error!("telegram adapter failed: {e:#}");
-            }
-        });
+    if !config.telegram.enabled {
+        bail!("no runtime adapters enabled; set telegram.enabled = true");
     }
 
-    let mut api = ApiDescription::new();
-    api.register(api_endpoints::download_endpoint)?;
-
-    let log = dropshot::ConfigLogging::StderrTerminal {
-        level: dropshot::ConfigLoggingLevel::Info,
-    }
-    .to_logger("mine-bot")
-    .map_err(|e| anyhow!(e.to_string()))?;
-
-    let server = HttpServerStarter::new(
-        &ConfigDropshot {
-            bind_address,
-            request_body_max_bytes: 20 * 1024 * 1024,
-            ..Default::default()
-        },
-        api,
-        app,
-        &log,
-    )
-    .map_err(|e| anyhow!(e.to_string()))?
-    .start();
-
+    let config = Arc::new(config);
     info!("mine-bot running");
-    server.await.map_err(|e| anyhow!(e))?;
-    Ok(())
+    run_telegram(config).await
 }
 
 fn apply_env_overrides(config: &mut Config) {
     if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
         config.telegram.bot_token = bot_token;
     }
-}
-
-fn resolve_bind_address(cli_host: Option<String>, cli_port: Option<u16>) -> Result<SocketAddr> {
-    Ok(SocketAddr::new(
-        resolve_api_host(cli_host)?,
-        resolve_api_port(cli_port)?,
-    ))
-}
-
-fn resolve_api_host(cli_host: Option<String>) -> Result<IpAddr> {
-    if let Some(host) = cli_host {
-        return parse_api_host(&host);
-    }
-
-    if let Ok(host) = std::env::var("HOST") {
-        return parse_api_host(&host);
-    }
-
-    parse_api_host(DEFAULT_API_HOST)
-}
-
-fn parse_api_host(host: &str) -> Result<IpAddr> {
-    host.parse::<IpAddr>()
-        .with_context(|| format!("invalid host value: {host}"))
-}
-
-fn resolve_api_port(cli_port: Option<u16>) -> Result<u16> {
-    if let Some(port) = cli_port {
-        return Ok(port);
-    }
-
-    if let Ok(port) = std::env::var("PORT") {
-        return port
-            .parse::<u16>()
-            .with_context(|| format!("invalid PORT value: {port}"));
-    }
-
-    if let Some(port) = load_shared_port(env!("CARGO_PKG_NAME"))? {
-        return Ok(port);
-    }
-
-    Ok(DEFAULT_API_PORT)
-}
-
-fn load_shared_port(program_name: &str) -> Result<Option<u16>> {
-    let path = Utf8PathBuf::from(SHARED_PORTS_PATH);
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("unable to read shared ports config at {path}"))?;
-    let ports: BTreeMap<String, u16> = serde_conl::from_str(&raw)
-        .with_context(|| format!("unable to parse shared ports config at {path}"))?;
-
-    Ok(ports.get(program_name).copied())
 }
 
 fn run_config_command(config_path: &Utf8PathBuf, command: ConfigSubcommand) -> Result<()> {
@@ -664,32 +539,11 @@ fn container_for_segment(segment: &PathSegment) -> Value {
     }
 }
 
-#[allow(dead_code)]
-mod api_endpoints {
-    use super::*;
-
-    #[endpoint {
-        method = POST,
-        path = "/download"
-    }]
-    pub(super) async fn download_endpoint(
-        rqctx: RequestContext<AppCtx>,
-        body: TypedBody<DownloadRequest>,
-    ) -> Result<HttpResponseCreated<DownloadResponse>, HttpError> {
-        let app = rqctx.context();
-        let result = download_media(app.config.clone(), "api", "api", &body.into_inner().url)
-            .await
-            .map_err(|e| HttpError::for_bad_request(None, format!("download failed: {e:#}")))?;
-
-        Ok(HttpResponseCreated(result))
-    }
-}
-
-async fn run_telegram(state: AppCtx) -> Result<()> {
-    let bot = Bot::new(state.config.telegram.bot_token.clone());
+async fn run_telegram(config: Arc<Config>) -> Result<()> {
+    let bot = Bot::new(config.telegram.bot_token.clone());
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
-        let state = state.clone();
+        let config = config.clone();
         async move {
             if let Some(text) = msg.text() {
                 let user_id = msg
@@ -698,7 +552,7 @@ async fn run_telegram(state: AppCtx) -> Result<()> {
                     .map(|u| u.id.0.to_string())
                     .unwrap_or_else(|| "unknown".into());
                 let download =
-                    download_media(state.config.clone(), "telegram", &user_id, text).await;
+                    download_media(config.as_ref(), "telegram", &user_id, text).await;
                 match download {
                     Ok(media) => {
                         bot.send_message(msg.chat.id, media.post_text.clone())
@@ -738,7 +592,7 @@ async fn run_telegram(state: AppCtx) -> Result<()> {
 }
 
 async fn download_media(
-    config: Config,
+    config: &Config,
     platform: &str,
     platform_user_id: &str,
     input_url: &str,
