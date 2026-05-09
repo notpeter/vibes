@@ -55,6 +55,7 @@ enum CliCommand {
 
 #[derive(Debug, Subcommand)]
 enum ConfigSubcommand {
+    Init,
     Schema,
     Check,
     Json,
@@ -173,6 +174,7 @@ enum PathSegment {
 const DEFAULT_API_PORT: u16 = 53211;
 const DEFAULT_API_HOST: &str = "127.0.0.1";
 const SHARED_PORTS_PATH: &str = "../conf/ports.conl";
+const CONFIG_TEMPLATE: &str = include_str!("../templates/config.conl");
 
 fn default_bind_address() -> String {
     format!("{DEFAULT_API_HOST}:{DEFAULT_API_PORT}")
@@ -317,6 +319,11 @@ fn load_shared_port(program_name: &str) -> Result<Option<u16>> {
 
 fn run_config_command(config_path: &Utf8PathBuf, command: ConfigSubcommand) -> Result<()> {
     match command {
+        ConfigSubcommand::Init => {
+            init_config(config_path)?;
+            println!("created {}", config_path);
+            Ok(())
+        }
         ConfigSubcommand::Schema => {
             let schema = schema_for!(Config);
             println!("{}", serde_json::to_string_pretty(&schema)?);
@@ -371,6 +378,22 @@ fn run_config_command(config_path: &Utf8PathBuf, command: ConfigSubcommand) -> R
             Ok(())
         }
     }
+}
+
+fn init_config(path: &Utf8PathBuf) -> Result<()> {
+    if path.exists() {
+        bail!("refusing to overwrite existing config at {path}");
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    fs::write(path, CONFIG_TEMPLATE)
+        .with_context(|| format!("unable to write config at {path}"))?;
+    Ok(())
 }
 
 fn load_or_default_config(path: &Utf8PathBuf) -> Result<LoadedConfig> {

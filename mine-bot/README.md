@@ -16,7 +16,7 @@ Rust Dropshot service + Telegram adapter for fetching social post media using `y
 
 ## Run
 ```bash
-cp config.example.conl config.conl
+cargo run -- config init
 # edit config.conl
 cargo run -- api
 ```
@@ -46,6 +46,7 @@ Telegram token selection order is:
 
 ## Config CLI
 ```bash
+cargo run -- config init
 cargo run -- config schema
 cargo run -- config check
 cargo run -- config json
