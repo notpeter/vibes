@@ -1,4 +1,4 @@
-// mine-bot configuration
+; mine-bot configuration
 bind_address = 127.0.0.1:53211
 database_path = ./mine-bot.sqlite
 download_dir = ./downloads

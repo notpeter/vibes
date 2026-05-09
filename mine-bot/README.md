@@ -23,7 +23,7 @@ cargo run -- api
 
 Default config path is `config.conl`. Override it with `-c/--config`.
 
-Config format is auto-detected as JSON when the first non-empty, non-`//` line starts with `{`. Otherwise it is parsed as CONL.
+Config format is auto-detected as JSON when the first non-empty line that is not a CONL `;` comment or JSONC `//` comment starts with `{`. Otherwise it is parsed as CONL. JSON inputs support whole-line `//` comments.
 
 Default bind address is `127.0.0.1:53211`.
 
@@ -39,6 +39,10 @@ API host selection order is:
 1. `--host`
 2. `HOST`
 3. built-in fallback `127.0.0.1`
+
+Telegram token selection order is:
+1. `TELEGRAM_BOT_TOKEN`
+2. `telegram.bot_token` in config
 
 ## Config CLI
 ```bash

@@ -206,7 +206,8 @@ async fn run_api(
     cli_host: Option<String>,
     cli_port: Option<u16>,
 ) -> Result<()> {
-    let config = load_config(&config_path)?.config;
+    let mut config = load_config(&config_path)?.config;
+    apply_env_overrides(&mut config);
     let bind_address = resolve_bind_address(cli_host, cli_port)?;
 
     fs::create_dir_all(&config.download_dir)?;
@@ -250,6 +251,12 @@ async fn run_api(
     info!("mine-bot running");
     server.await.map_err(|e| anyhow!(e))?;
     Ok(())
+}
+
+fn apply_env_overrides(config: &mut Config) {
+    if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
+        config.telegram.bot_token = bot_token;
+    }
 }
 
 fn resolve_bind_address(cli_host: Option<String>, cli_port: Option<u16>) -> Result<SocketAddr> {
@@ -302,9 +309,8 @@ fn load_shared_port(program_name: &str) -> Result<Option<u16>> {
 
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("unable to read shared ports config at {path}"))?;
-    let ports: BTreeMap<String, u16> =
-        serde_conl::from_str(&strip_double_slash_comment_lines(&raw))
-            .with_context(|| format!("unable to parse shared ports config at {path}"))?;
+    let ports: BTreeMap<String, u16> = serde_conl::from_str(&raw)
+        .with_context(|| format!("unable to parse shared ports config at {path}"))?;
 
     Ok(ports.get(program_name).copied())
 }
@@ -382,11 +388,10 @@ fn load_config(path: &Utf8PathBuf) -> Result<LoadedConfig> {
     let raw =
         fs::read_to_string(path).with_context(|| format!("unable to read config at {path}"))?;
     let format = detect_config_format(&raw);
-    let stripped = strip_double_slash_comment_lines(&raw);
     let config = match format {
-        ConfigFormat::Json => serde_json::from_str(&stripped)
+        ConfigFormat::Json => serde_json::from_str(&strip_jsonc_comment_lines(&raw))
             .with_context(|| format!("unable to parse JSON config at {path}"))?,
-        ConfigFormat::Conl => serde_conl::from_str(&stripped)
+        ConfigFormat::Conl => serde_conl::from_str(&raw)
             .with_context(|| format!("unable to parse CONL config at {path}"))?,
     };
 
@@ -425,7 +430,7 @@ fn default_format_for_path(path: &Utf8PathBuf) -> ConfigFormat {
 fn detect_config_format(text: &str) -> ConfigFormat {
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with("//") {
+        if trimmed.is_empty() || trimmed.starts_with(';') || trimmed.starts_with("//") {
             continue;
         }
         return if trimmed.starts_with('{') {
@@ -437,7 +442,7 @@ fn detect_config_format(text: &str) -> ConfigFormat {
     ConfigFormat::Conl
 }
 
-fn strip_double_slash_comment_lines(text: &str) -> String {
+fn strip_jsonc_comment_lines(text: &str) -> String {
     let mut lines = Vec::new();
     for line in text.lines() {
         if line.trim_start().starts_with("//") {
