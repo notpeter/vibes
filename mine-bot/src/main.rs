@@ -156,6 +156,7 @@ impl UserRole {
 struct DownloadResponse {
     media_id: i64,
     normalized_url: String,
+    post_platform: String,
     post_title: Option<String>,
     post_source: String,
     post_date: String,
@@ -167,6 +168,7 @@ struct DownloadResponse {
 #[derive(Debug, Clone)]
 struct DeliveryFilenameMetadata {
     filename_username: String,
+    platform_name: String,
     source_name: String,
     source_handle: Option<String>,
     date: String,
@@ -231,8 +233,11 @@ async fn main() -> Result<()> {
 
     match cli.command {
         CliCommand::Run => {
+            let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
             tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_env_filter(env_filter)
+                .with_writer(std::io::stdout)
                 .init();
             run_bot(cli.config).await
         }
@@ -640,6 +645,14 @@ async fn run_telegram(config: Arc<Config>) -> Result<()> {
                 };
                 let user_id = from.id.0.to_string();
                 let username = normalize_telegram_username(from.username.as_deref());
+                info!(
+                    "telegram message received chat_id={} message_id={} user_id={} username={} text={:?}",
+                    msg.chat.id.0,
+                    msg.id.0,
+                    user_id,
+                    username.as_deref().unwrap_or("-"),
+                    preview_log_text(text)
+                );
                 let role = match authorize_user(
                     config.as_ref(),
                     "telegram",
@@ -954,6 +967,7 @@ async fn send_download_result(
     bot.send_message(
         msg.chat.id,
         format_post_text_html(
+            &media.post_platform,
             media.post_title.as_deref(),
             &media.post_source,
             &media.post_date,
@@ -962,11 +976,11 @@ async fn send_download_result(
     )
     .parse_mode(ParseMode::Html)
     .link_preview_options(LinkPreviewOptions {
-        is_disabled: true,
-        url: None,
+        is_disabled: false,
+        url: Some(media.normalized_url.clone()),
         prefer_small_media: false,
-        prefer_large_media: false,
-        show_above_text: false,
+        prefer_large_media: true,
+        show_above_text: true,
     })
     .await?;
     if media.files.len() == 1 {
@@ -984,6 +998,10 @@ async fn send_download_result(
                     .duration(metadata.duration_seconds);
             }
             request.await?;
+            info!(
+                "telegram processed video sent chat_id={} message_id={} file={}",
+                msg.chat.id.0, msg.id.0, file
+            );
         }
     } else {
         let photos: Vec<InputMedia> = media
@@ -999,8 +1017,32 @@ async fn send_download_result(
     Ok(())
 }
 
-fn format_post_text_html(title: Option<&str>, source: &str, date: &str, body: &str) -> String {
+fn preview_log_text(input: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let mut preview = String::new();
+    for (index, ch) in input.chars().enumerate() {
+        if index >= MAX_CHARS {
+            preview.push_str("...");
+            return preview;
+        }
+        preview.push(ch);
+    }
+    preview
+}
+
+fn format_post_text_html(
+    platform: &str,
+    title: Option<&str>,
+    source: &str,
+    date: &str,
+    body: &str,
+) -> String {
     let mut out = String::new();
+    if !platform.trim().is_empty() {
+        out.push('(');
+        out.push_str(&escape_html(platform));
+        out.push_str(")\n");
+    }
     if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
         out.push_str("<b>");
         out.push_str(&escape_html(title));
@@ -1063,10 +1105,12 @@ async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResp
     let convert_ms = normalize_started.elapsed().as_millis() as i64;
 
     let description = read_sidecar_text(&item_dir).unwrap_or_else(|| "(no description)".into());
+    let post_platform = filename_metadata.platform_name.clone();
     let post_title = display_post_title(&filename_metadata);
     let post_source = format_post_source_line(&filename_metadata);
     let post_date = filename_metadata.date.clone();
     let post_text = compose_post_text(
+        &post_platform,
         post_title.as_deref(),
         &post_source,
         &post_date,
@@ -1085,6 +1129,7 @@ async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResp
     Ok(DownloadResponse {
         media_id,
         normalized_url: normalized,
+        post_platform,
         post_title,
         post_source,
         post_date,
@@ -1340,6 +1385,7 @@ fn read_sidecar_text(dir: &Utf8PathBuf) -> Option<String> {
 
 fn read_delivery_filename_metadata(dir: &Utf8PathBuf) -> DeliveryFilenameMetadata {
     let info = read_info_json(dir).unwrap_or(Value::Null);
+    let platform_name = read_platform_name(&info);
     let source_name = read_string_field(&info, &["channel", "uploader", "creator", "artist"])
         .unwrap_or_else(|| "unknown".into());
     let source_handle = read_source_handle(&info);
@@ -1361,6 +1407,7 @@ fn read_delivery_filename_metadata(dir: &Utf8PathBuf) -> DeliveryFilenameMetadat
     };
     DeliveryFilenameMetadata {
         filename_username,
+        platform_name,
         source_name,
         source_handle,
         date: read_upload_date(&info).unwrap_or_else(current_delivery_date),
@@ -1388,6 +1435,58 @@ fn read_string_field(value: &Value, keys: &[&str]) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn read_platform_name(value: &Value) -> String {
+    let raw = read_string_field(value, &["extractor_key", "extractor", "webpage_url_domain"])
+        .unwrap_or_else(|| "unknown".into());
+    normalize_platform_name(&raw)
+}
+
+fn normalize_platform_name(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.contains("youtube") {
+        return "YouTube".into();
+    }
+    if lower.contains("instagram") {
+        return "Instagram".into();
+    }
+    if lower.contains("tiktok") {
+        return "TikTok".into();
+    }
+    if lower.contains("twitter") || lower == "x" || lower.contains("x.com") {
+        return "X".into();
+    }
+    if lower.contains("reddit") {
+        return "Reddit".into();
+    }
+
+    let platform = lower
+        .split(['.', ':'])
+        .next()
+        .unwrap_or(lower.as_str())
+        .split(['_', '-', ' '])
+        .filter(|part| !part.is_empty())
+        .map(title_case_ascii)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if platform.is_empty() {
+        "Unknown".into()
+    } else {
+        platform
+    }
+}
+
+fn title_case_ascii(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    if let Some(first) = chars.next() {
+        out.extend(first.to_uppercase());
+    }
+    for ch in chars {
+        out.extend(ch.to_lowercase());
+    }
+    out
 }
 
 fn is_youtube_source(value: &Value) -> bool {
@@ -1608,8 +1707,19 @@ fn display_post_title(metadata: &DeliveryFilenameMetadata) -> Option<String> {
     }
 }
 
-fn compose_post_text(title: Option<&str>, source: &str, date: &str, body: &str) -> String {
+fn compose_post_text(
+    platform: &str,
+    title: Option<&str>,
+    source: &str,
+    date: &str,
+    body: &str,
+) -> String {
     let mut out = String::new();
+    if !platform.trim().is_empty() {
+        out.push('(');
+        out.push_str(platform);
+        out.push_str(")\n");
+    }
     if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
         out.push_str(title);
         out.push('\n');
