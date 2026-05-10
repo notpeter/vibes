@@ -1,5 +1,5 @@
-; mine-bot configuration
-database_path = ./mine-bot.sqlite
+; notnotsavebot configuration
+;database_path = ./notnotsavebot.sqlite
 download_dir = ./downloads
 
 telegram

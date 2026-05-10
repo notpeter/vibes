@@ -29,7 +29,7 @@ use uuid::Uuid;
 use which::which;
 
 #[derive(Debug, Parser)]
-#[command(name = "mine-bot")]
+#[command(name = "notnotsavebot")]
 struct Cli {
     #[arg(short = 'c', long = "config", default_value = "config.conl")]
     config: Utf8PathBuf,
@@ -212,7 +212,7 @@ enum PathSegment {
 const CONFIG_TEMPLATE: &str = include_str!("../templates/config.conl");
 
 fn default_database_path() -> Utf8PathBuf {
-    Utf8PathBuf::from("./mine-bot.sqlite")
+    Utf8PathBuf::from("./notnotsavebot.sqlite")
 }
 
 fn default_download_dir() -> Utf8PathBuf {
@@ -258,7 +258,6 @@ async fn run_bot(config_path: Utf8PathBuf) -> Result<()> {
     }
 
     let config = Arc::new(config);
-    info!("mine-bot running");
     run_telegram(config).await
 }
 
@@ -632,7 +631,7 @@ fn container_for_segment(segment: &PathSegment) -> Value {
 async fn run_telegram(config: Arc<Config>) -> Result<()> {
     let bot = Bot::new(config.telegram.bot_token.clone());
     let me = bot.get_me().await?;
-    let bot_name = me.user.username.unwrap_or_else(|| "mine-bot".to_string());
+    let bot_name = me.user.username.unwrap_or_else(|| "notnotsavebot".to_string());
     bot.set_my_commands(Vec::<BotCommand>::new()).await?;
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {

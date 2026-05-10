@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Project
-- `mine-bot` is a Rust 2024 Telegram bot.
+- `notnotsavebot` is a Rust 2024 Telegram bot.
 - It accepts social/media post URLs, downloads media with `yt-dlp`, normalizes delivery media with `ffmpeg`, and sends the result back to Telegram.
 - Persistent state is stored in SQLite.
 

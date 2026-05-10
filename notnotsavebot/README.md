@@ -1,4 +1,4 @@
-# mine-bot
+# notnotsavebot
 
 Rust Telegram bot for fetching social post media using `yt-dlp`.
 
