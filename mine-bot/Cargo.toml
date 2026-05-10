@@ -19,3 +19,4 @@ camino = { version = "1", features = ["serde1"] }
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+which = "8"

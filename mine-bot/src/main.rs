@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::Instant,
@@ -16,12 +16,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use teloxide::{
     prelude::*,
-    types::{InputFile, InputMedia, InputMediaPhoto},
+    types::{InputFile, InputMedia, InputMediaPhoto, LinkPreviewOptions, ParseMode},
+    utils::command::BotCommands,
 };
 use tokio::{process::Command as TokioCommand, task};
-use tracing::info;
+use tracing::{error, info};
 use url::Url;
 use uuid::Uuid;
+use which::which;
 
 #[derive(Debug, Parser)]
 #[command(name = "mine-bot")]
@@ -113,7 +115,7 @@ struct SeedUser {
     role: UserRole,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum UserRole {
     Admin,
@@ -129,6 +131,19 @@ impl UserRole {
             UserRole::None => "none",
         }
     }
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "admin" => Ok(UserRole::Admin),
+            "user" => Ok(UserRole::User),
+            "none" => Ok(UserRole::None),
+            _ => bail!("invalid stored user role: {value}"),
+        }
+    }
+
+    fn is_allowed(self) -> bool {
+        matches!(self, UserRole::Admin | UserRole::User)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -137,6 +152,26 @@ struct DownloadResponse {
     normalized_url: String,
     post_text: String,
     files: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DeliveryFilenameMetadata {
+    username: String,
+    date: String,
+    title: String,
+}
+
+#[derive(BotCommands, Clone)]
+#[command(rename_rule = "lowercase", description = "Available commands:")]
+enum TelegramCommand {
+    #[command(description = "show a short introduction")]
+    Start,
+    #[command(description = "show this help message")]
+    Help,
+    #[command(description = "show your Telegram user id")]
+    Id,
+    #[command(description = "download media from a URL")]
+    Download(String),
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +189,8 @@ fn default_database_path() -> Utf8PathBuf {
 fn default_download_dir() -> Utf8PathBuf {
     Utf8PathBuf::from("./downloads")
 }
+
+const MAX_DELIVERY_FILENAME_LEN: usize = 79;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -173,6 +210,7 @@ async fn main() -> Result<()> {
 async fn run_bot(config_path: Utf8PathBuf) -> Result<()> {
     let mut config = load_config(&config_path)?.config;
     apply_env_overrides(&mut config);
+    ensure_runtime_tools()?;
 
     fs::create_dir_all(&config.download_dir)?;
     init_db(&config)?;
@@ -190,6 +228,18 @@ fn apply_env_overrides(config: &mut Config) {
     if let Ok(bot_token) = std::env::var("TELEGRAM_BOT_TOKEN") {
         config.telegram.bot_token = bot_token;
     }
+}
+
+fn ensure_runtime_tools() -> Result<()> {
+    let yt_dlp = which("yt-dlp")
+        .context("required tool `yt-dlp` was not found on PATH; install it or fix the bot service PATH")?;
+    info!("found yt-dlp at {}", yt_dlp.display());
+
+    let ffmpeg = which("ffmpeg")
+        .context("required tool `ffmpeg` was not found on PATH; install it or fix the bot service PATH")?;
+    info!("found ffmpeg at {}", ffmpeg.display());
+
+    Ok(())
 }
 
 fn run_config_command(config_path: &Utf8PathBuf, command: ConfigSubcommand) -> Result<()> {
@@ -541,9 +591,13 @@ fn container_for_segment(segment: &PathSegment) -> Value {
 
 async fn run_telegram(config: Arc<Config>) -> Result<()> {
     let bot = Bot::new(config.telegram.bot_token.clone());
+    let me = bot.get_me().await?;
+    let bot_name = me.user.username.unwrap_or_else(|| "mine-bot".to_string());
+    bot.set_my_commands(TelegramCommand::bot_commands()).await?;
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let config = config.clone();
+        let bot_name = bot_name.clone();
         async move {
             if let Some(text) = msg.text() {
                 let user_id = msg
@@ -551,37 +605,38 @@ async fn run_telegram(config: Arc<Config>) -> Result<()> {
                     .as_ref()
                     .map(|u| u.id.0.to_string())
                     .unwrap_or_else(|| "unknown".into());
-                let download =
-                    download_media(config.as_ref(), "telegram", &user_id, text).await;
-                match download {
-                    Ok(media) => {
-                        bot.send_message(msg.chat.id, media.post_text.clone())
-                            .await?;
-                        if media.files.len() == 1 {
-                            bot.send_video(
-                                msg.chat.id,
-                                InputFile::file(PathBuf::from(&media.files[0])),
-                            )
-                            .await?;
-                        } else {
-                            let photos: Vec<InputMedia> = media
-                                .files
-                                .iter()
-                                .map(|f| {
-                                    InputMedia::Photo(InputMediaPhoto::new(InputFile::file(
-                                        PathBuf::from(f),
-                                    )))
-                                })
-                                .collect();
-                            if !photos.is_empty() {
-                                bot.send_media_group(msg.chat.id, photos).await?;
-                            }
-                        }
+                let role = match authorize_user(config.as_ref(), "telegram", &user_id) {
+                    Ok(role) if role.is_allowed() => role,
+                    Ok(_) => {
+                        bot.send_message(
+                            msg.chat.id,
+                            format!(
+                                "You are not authorized to use this bot. Your Telegram user id is {user_id}."
+                            ),
+                        )
+                        .await?;
+                        return respond(());
                     }
                     Err(e) => {
-                        bot.send_message(msg.chat.id, format!("Download failed: {e:#}"))
-                            .await?;
+                        bot.send_message(
+                            msg.chat.id,
+                            format!("Authorization check failed: {e:#}"),
+                        )
+                        .await?;
+                        return respond(());
                     }
+                };
+                if let Ok(command) = TelegramCommand::parse(text, &bot_name) {
+                    handle_telegram_command(&bot, &msg, config.as_ref(), &user_id, role, command)
+                        .await?;
+                } else if text.trim_start().starts_with('/') {
+                    bot.send_message(
+                        msg.chat.id,
+                        "Unknown command. Use /help to see supported commands.",
+                    )
+                    .await?;
+                } else {
+                    handle_download_request(&bot, &msg, config.as_ref(), text).await?;
                 }
             }
             respond(())
@@ -591,21 +646,130 @@ async fn run_telegram(config: Arc<Config>) -> Result<()> {
     Ok(())
 }
 
+async fn handle_telegram_command(
+    bot: &Bot,
+    msg: &Message,
+    config: &Config,
+    user_id: &str,
+    _role: UserRole,
+    command: TelegramCommand,
+) -> ResponseResult<()> {
+    match command {
+        TelegramCommand::Start => {
+            let text = concat!(
+                "Send me a post URL and I will fetch the media for you.\n",
+                "You can also use /download <url> explicitly.\n",
+                "Use /help to see the available commands."
+            );
+            bot.send_message(msg.chat.id, text).await?;
+        }
+        TelegramCommand::Help => {
+            bot.send_message(msg.chat.id, TelegramCommand::descriptions().to_string())
+                .await?;
+        }
+        TelegramCommand::Id => {
+            bot.send_message(msg.chat.id, format!("Your Telegram user id is {user_id}."))
+                .await?;
+        }
+        TelegramCommand::Download(url) => {
+            handle_download_request(bot, msg, config, &url).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_download_request(
+    bot: &Bot,
+    msg: &Message,
+    config: &Config,
+    input: &str,
+) -> ResponseResult<()> {
+    let download = download_media(config, input).await;
+    match download {
+        Ok(media) => send_download_result(bot, msg, media).await?,
+        Err(e) => {
+            error!(
+                "download request failed for chat {} input {:?}: {e:#}",
+                msg.chat.id.0,
+                input
+            );
+            bot.send_message(msg.chat.id, format!("Download failed: {e:#}"))
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_download_result(
+    bot: &Bot,
+    msg: &Message,
+    media: DownloadResponse,
+) -> ResponseResult<()> {
+    bot.send_message(msg.chat.id, format_post_text_html(&media.post_text))
+        .parse_mode(ParseMode::Html)
+        .link_preview_options(LinkPreviewOptions {
+            is_disabled: true,
+            url: None,
+            prefer_small_media: false,
+            prefer_large_media: false,
+            show_above_text: false,
+        })
+        .await?;
+    if media.files.len() == 1 {
+        let file = &media.files[0];
+        if is_image_path(file) {
+            bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(file)))
+                .await?;
+        } else {
+            bot.send_video(msg.chat.id, InputFile::file(PathBuf::from(file)))
+                .await?;
+        }
+    } else {
+        let photos: Vec<InputMedia> = media
+            .files
+            .iter()
+            .map(|f| InputMedia::Photo(InputMediaPhoto::new(InputFile::file(PathBuf::from(f)))))
+            .collect();
+        if !photos.is_empty() {
+            bot.send_media_group(msg.chat.id, photos).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn format_post_text_html(text: &str) -> String {
+    format!("<blockquote>{}</blockquote>", escape_html(text))
+}
+
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 async fn download_media(
     config: &Config,
-    platform: &str,
-    platform_user_id: &str,
     input_url: &str,
 ) -> Result<DownloadResponse> {
     let normalized = Url::parse(input_url)?.to_string();
-    upsert_user(&config, platform, platform_user_id, UserRole::None)?;
 
     let started = Instant::now();
     let item_dir = config.download_dir.join(Uuid::new_v4().to_string());
     fs::create_dir_all(&item_dir)?;
     let out_tmpl = item_dir.join("%(title).100B-%(id)s.%(ext)s");
 
-    let status = TokioCommand::new("yt-dlp")
+    let output = TokioCommand::new("yt-dlp")
         .arg("-f")
         .arg("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b")
         .arg("--merge-output-format")
@@ -619,26 +783,28 @@ async fn download_media(
         .arg(&normalized)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .status()
+        .output()
         .await?;
 
-    if !status.success() {
-        return Err(anyhow!("yt-dlp failed with status: {status}"));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err(anyhow!("yt-dlp failed with status: {}", output.status));
+        }
+        return Err(anyhow!(
+            "yt-dlp failed with status {}: {}",
+            output.status,
+            stderr
+        ));
     }
     let download_ms = started.elapsed().as_millis() as i64;
 
-    let files: Vec<String> = fs::read_dir(&item_dir)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .is_some_and(|x| x == "mp4" || x == "jpg" || x == "png")
-        })
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
+    let normalize_started = Instant::now();
+    let filename_metadata = read_delivery_filename_metadata(&item_dir);
+    let files = collect_delivery_files(&item_dir, &filename_metadata).await?;
+    let convert_ms = normalize_started.elapsed().as_millis() as i64;
 
     let description = read_sidecar_text(&item_dir).unwrap_or_else(|| "(no description)".into());
-    let convert_ms = 0_i64;
 
     let media_id = insert_media_record(
         &config,
@@ -657,6 +823,100 @@ async fn download_media(
     })
 }
 
+fn is_image_path(path: &str) -> bool {
+    path.ends_with(".jpg") || path.ends_with(".jpeg") || path.ends_with(".png")
+}
+
+async fn collect_delivery_files(
+    item_dir: &Utf8PathBuf,
+    filename_metadata: &DeliveryFilenameMetadata,
+) -> Result<Vec<String>> {
+    let mut video_files = Vec::new();
+    let mut audio_files = Vec::new();
+    let mut image_files = Vec::new();
+
+    for entry in fs::read_dir(item_dir)? {
+        let path = entry?.path();
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("mp4") => video_files.push(path),
+            Some("m4a") => audio_files.push(path),
+            Some("jpg" | "jpeg" | "png") => image_files.push(path),
+            _ => {}
+        }
+    }
+
+    video_files.sort();
+    audio_files.sort();
+    image_files.sort();
+
+    if let Some(video_path) = video_files.first() {
+        let normalized = normalize_video_for_delivery(video_path, audio_files.first()).await?;
+        let renamed = rename_delivery_file(&normalized, filename_metadata, None)?;
+        return Ok(vec![renamed.to_string_lossy().to_string()]);
+    }
+
+    let total_images = image_files.len();
+    let mut files = Vec::with_capacity(total_images);
+    for (index, path) in image_files.into_iter().enumerate() {
+        let suffix = (total_images > 1).then_some(index + 1);
+        let renamed = rename_delivery_file(&path, filename_metadata, suffix)?;
+        files.push(renamed.to_string_lossy().to_string());
+    }
+    if files.is_empty() {
+        bail!("yt-dlp produced no deliverable media files");
+    }
+    Ok(files)
+}
+
+async fn normalize_video_for_delivery(video_path: &PathBuf, audio_path: Option<&PathBuf>) -> Result<PathBuf> {
+    let output_path = video_path.with_file_name("delivery.mp4");
+    let mut cmd = TokioCommand::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(video_path);
+
+    if let Some(audio_path) = audio_path {
+        cmd.arg("-i")
+            .arg(audio_path)
+            .arg("-map")
+            .arg("0:v:0")
+            .arg("-map")
+            .arg("1:a:0")
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg("128k");
+    } else {
+        cmd.arg("-map").arg("0:v:0").arg("-an");
+    }
+
+    let output = cmd
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("veryfast")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(&output_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!("ffmpeg failed with status {}", output.status);
+        }
+        bail!("ffmpeg failed with status {}: {}", output.status, stderr);
+    }
+
+    Ok(output_path)
+}
+
 fn read_sidecar_text(dir: &Utf8PathBuf) -> Option<String> {
     fs::read_dir(dir)
         .ok()?
@@ -665,6 +925,168 @@ fn read_sidecar_text(dir: &Utf8PathBuf) -> Option<String> {
         .find(|p| p.extension().is_some_and(|x| x == "description"))
         .and_then(|p| fs::read_to_string(p).ok())
         .map(|s| s.trim().to_string())
+}
+
+fn read_delivery_filename_metadata(dir: &Utf8PathBuf) -> DeliveryFilenameMetadata {
+    let info = read_info_json(dir).unwrap_or(Value::Null);
+    DeliveryFilenameMetadata {
+        username: read_string_field(
+            &info,
+            &[
+                "uploader",
+                "channel",
+                "creator",
+                "artist",
+                "uploader_id",
+                "channel_id",
+            ],
+        )
+        .unwrap_or_else(|| "unknown".into()),
+        date: read_upload_date(&info).unwrap_or_else(current_delivery_date),
+        title: read_string_field(&info, &["title", "fulltitle", "alt_title"])
+            .unwrap_or_else(|| "untitled".into()),
+    }
+}
+
+fn read_info_json(dir: &Utf8PathBuf) -> Option<Value> {
+    let info_path = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json") && path.to_string_lossy().ends_with(".info.json"))?;
+    let raw = fs::read_to_string(info_path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn read_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key)?.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn read_upload_date(value: &Value) -> Option<String> {
+    for key in ["upload_date", "release_date"] {
+        if let Some(date) = value.get(key).and_then(Value::as_str) {
+            if let Some(formatted) = format_compact_date(date) {
+                return Some(formatted);
+            }
+        }
+    }
+
+    if let Some(timestamp) = value.get("timestamp").and_then(Value::as_i64) {
+        if let Some(date) = DateTime::<Utc>::from_timestamp(timestamp, 0) {
+            return Some(date.format("%Y %m %d").to_string());
+        }
+    }
+
+    None
+}
+
+fn format_compact_date(input: &str) -> Option<String> {
+    if input.len() != 8 || !input.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    Some(format!(
+        "{} {} {}",
+        &input[0..4],
+        &input[4..6],
+        &input[6..8]
+    ))
+}
+
+fn current_delivery_date() -> String {
+    Utc::now().format("%Y %m %d").to_string()
+}
+
+fn rename_delivery_file(
+    path: &Path,
+    metadata: &DeliveryFilenameMetadata,
+    sequence: Option<usize>,
+) -> Result<PathBuf> {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .ok_or_else(|| anyhow!("downloaded media file has no extension: {}", path.display()))?;
+
+    let suffix = sequence.map(|index| format!("_{index:02}")).unwrap_or_default();
+    let max_base_len = MAX_DELIVERY_FILENAME_LEN
+        .saturating_sub(extension.chars().count() + 1)
+        .saturating_sub(suffix.chars().count());
+    let base = build_delivery_basename(metadata, max_base_len);
+    let filename = format!("{base}{suffix}.{extension}");
+    let renamed = path.with_file_name(filename);
+
+    if renamed != path {
+        fs::rename(path, &renamed)?;
+    }
+
+    Ok(renamed)
+}
+
+fn build_delivery_basename(metadata: &DeliveryFilenameMetadata, max_len: usize) -> String {
+    let username = sanitize_filename_part(&metadata.username, "unknown");
+    let date = sanitize_filename_part(&metadata.date, "unknown");
+    let title = sanitize_filename_part(&metadata.title, "untitled");
+
+    let prefix = truncate_prefix_with_date(&username, &date, max_len);
+    if prefix.chars().count() >= max_len || title.is_empty() {
+        return prefix;
+    }
+
+    let title_budget = max_len.saturating_sub(prefix.chars().count() + 1);
+    let title = truncate_to_chars(&title, title_budget);
+    if title.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}_{title}")
+    }
+}
+
+fn truncate_prefix_with_date(username: &str, date: &str, max_len: usize) -> String {
+    let full_prefix = format!("{username}_{date}");
+    if full_prefix.chars().count() <= max_len {
+        return full_prefix;
+    }
+
+    let reserved_for_date = date.chars().count() + 1;
+    if reserved_for_date < max_len {
+        let username_budget = max_len - reserved_for_date;
+        let username = truncate_to_chars(username, username_budget);
+        if username.is_empty() {
+            return truncate_to_chars(date, max_len);
+        }
+        return format!("{username}_{date}");
+    }
+
+    truncate_to_chars(date, max_len)
+}
+
+fn sanitize_filename_part(input: &str, fallback: &str) -> String {
+    let normalized: String = input
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch == ' ' {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect();
+
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join("_");
+    if collapsed.is_empty() {
+        fallback.to_string()
+    } else {
+        collapsed
+    }
+}
+
+fn truncate_to_chars(input: &str, max_chars: usize) -> String {
+    input.chars().take(max_chars).collect()
 }
 
 fn db_conn(config: &Config) -> Result<Connection> {
@@ -718,6 +1140,25 @@ fn upsert_user(
         params![platform, platform_user_id, role.as_str(), now.to_rfc3339()],
     )?;
     Ok(())
+}
+
+fn authorize_user(config: &Config, platform: &str, platform_user_id: &str) -> Result<UserRole> {
+    let conn = db_conn(config)?;
+    let now: DateTime<Utc> = Utc::now();
+    conn.execute(
+        "INSERT INTO users(platform, platform_user_id, role, created_at, updated_at)
+         VALUES (?1, ?2, 'none', ?3, ?3)
+         ON CONFLICT(platform, platform_user_id)
+         DO UPDATE SET updated_at = excluded.updated_at",
+        params![platform, platform_user_id, now.to_rfc3339()],
+    )?;
+
+    let role: String = conn.query_row(
+        "SELECT role FROM users WHERE platform = ?1 AND platform_user_id = ?2",
+        params![platform, platform_user_id],
+        |row| row.get(0),
+    )?;
+    UserRole::from_str(&role)
 }
 
 fn insert_media_record(

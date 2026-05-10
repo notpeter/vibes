@@ -8,12 +8,16 @@ Rust Telegram bot for fetching social post media using `yt-dlp`.
 - Returns post description + media (single video or grouped images in Telegram).
 - Stores users and media metadata in SQLite.
 - Seeds user roles (`admin|user|none`) from config at startup.
+- Only users seeded with role `admin` or `user` are allowed to use the bot; everyone else is rejected by default.
 - Uses the shared `download_media()` path directly instead of exposing an HTTP API.
+- Supports Telegram slash commands including `/start`, `/help`, `/id`, and `/download <url>`.
 
 ## Requirements
 - Linux
 - `yt-dlp` available on `$PATH`
-- Optional `ffmpeg` for remux/merge
+- `ffmpeg` available on `$PATH`
+
+Startup validates that both `yt-dlp` and `ffmpeg` are present on `PATH`.
 
 ## Run
 ```bash
