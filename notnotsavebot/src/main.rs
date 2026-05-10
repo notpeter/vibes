@@ -631,7 +631,10 @@ fn container_for_segment(segment: &PathSegment) -> Value {
 async fn run_telegram(config: Arc<Config>) -> Result<()> {
     let bot = Bot::new(config.telegram.bot_token.clone());
     let me = bot.get_me().await?;
-    let bot_name = me.user.username.unwrap_or_else(|| "notnotsavebot".to_string());
+    let bot_name = me
+        .user
+        .username
+        .unwrap_or_else(|| "notnotsavebot".to_string());
     bot.set_my_commands(Vec::<BotCommand>::new()).await?;
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
@@ -975,11 +978,11 @@ async fn send_download_result(
     )
     .parse_mode(ParseMode::Html)
     .link_preview_options(LinkPreviewOptions {
-        is_disabled: false,
-        url: Some(media.normalized_url.clone()),
+        is_disabled: true,
+        url: None,
         prefer_small_media: false,
-        prefer_large_media: true,
-        show_above_text: true,
+        prefer_large_media: false,
+        show_above_text: false,
     })
     .await?;
     if media.files.len() == 1 {
@@ -1075,8 +1078,23 @@ fn escape_html(text: &str) -> String {
     escaped
 }
 
+fn normalize_input_url(input_url: &str) -> Result<String> {
+    let mut url = Url::parse(input_url.trim())?;
+    if let Some(host) = url.host_str() {
+        let host = host.to_ascii_lowercase();
+        if host == "x.com"
+            || host == "www.x.com"
+            || host == "twitter.com"
+            || host == "www.twitter.com"
+        {
+            url.set_query(None);
+        }
+    }
+    Ok(url.to_string())
+}
+
 async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResponse> {
-    let normalized = Url::parse(input_url)?.to_string();
+    let normalized = normalize_input_url(input_url)?;
 
     let started = Instant::now();
     let item_dir = config.download_dir.join(Uuid::new_v4().to_string());
@@ -1385,8 +1403,11 @@ fn read_sidecar_text(dir: &Utf8PathBuf) -> Option<String> {
 fn read_delivery_filename_metadata(dir: &Utf8PathBuf) -> DeliveryFilenameMetadata {
     let info = read_info_json(dir).unwrap_or(Value::Null);
     let platform_name = read_platform_name(&info);
-    let source_name = read_string_field(&info, &["channel", "uploader", "creator", "artist"])
-        .unwrap_or_else(|| "unknown".into());
+    let source_name = clean_source_name_for_platform(
+        &platform_name,
+        read_string_field(&info, &["channel", "uploader", "creator", "artist"])
+            .unwrap_or_else(|| "unknown".into()),
+    );
     let source_handle = read_source_handle(&info);
     let filename_username = if is_youtube_source(&info) {
         source_handle.clone().unwrap_or_else(|| source_name.clone())
@@ -1413,6 +1434,19 @@ fn read_delivery_filename_metadata(dir: &Utf8PathBuf) -> DeliveryFilenameMetadat
         title: read_string_field(&info, &["title", "fulltitle", "alt_title"])
             .unwrap_or_else(|| "untitled".into()),
     }
+}
+
+fn clean_source_name_for_platform(platform_name: &str, source_name: String) -> String {
+    if platform_name == "X" {
+        let trimmed = source_name.trim();
+        if let Some(prefix) = trimmed.strip_suffix(" on X") {
+            let clean = prefix.trim();
+            if !clean.is_empty() {
+                return clean.to_string();
+            }
+        }
+    }
+    source_name
 }
 
 fn read_info_json(dir: &Utf8PathBuf) -> Option<Value> {
