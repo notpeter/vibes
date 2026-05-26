@@ -1224,7 +1224,14 @@ async fn normalize_video_for_delivery(
             .arg("-b:a")
             .arg("128k");
     } else {
-        cmd.arg("-map").arg("0:v:0").arg("-an");
+        cmd.arg("-map")
+            .arg("0:v:0")
+            .arg("-map")
+            .arg("0:a:0?")
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg("128k");
     }
 
     let output = cmd
