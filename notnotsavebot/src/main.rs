@@ -175,6 +175,14 @@ struct DeliveryFilenameMetadata {
     title: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TwitterPostMetadata {
+    source_name: String,
+    source_handle: Option<String>,
+    timestamp: Option<i64>,
+    text: String,
+}
+
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Available commands:")]
 enum AdminTelegramCommand {
@@ -1110,6 +1118,11 @@ async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResp
                 "yt-dlp could not download Instagram post directly; trying embed image fallback: {}",
                 stderr
             );
+        } else if should_continue_with_twitter_image_fallback(&normalized, &stderr) {
+            warn!(
+                "yt-dlp could not download Twitter/X post directly; trying image fallback: {}",
+                stderr
+            );
         } else if stderr.is_empty() {
             return Err(anyhow!("yt-dlp failed with status: {}", output.status));
         } else {
@@ -1124,6 +1137,7 @@ async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResp
 
     let normalize_started = Instant::now();
     download_instagram_embed_images_if_needed(&normalized, &item_dir).await?;
+    download_twitter_images_if_needed(&normalized, &item_dir).await?;
     let filename_metadata = read_delivery_filename_metadata(&item_dir);
     let files = collect_delivery_files(&item_dir, &filename_metadata).await?;
     let convert_ms = normalize_started.elapsed().as_millis() as i64;
@@ -1233,6 +1247,73 @@ async fn download_instagram_embed_images_if_needed(
 fn should_continue_with_instagram_embed_fallback(normalized: &str, stderr: &str) -> bool {
     should_retry_without_video_format(stderr)
         && instagram_shortcode_from_url(normalized)
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+async fn download_twitter_images_if_needed(normalized: &str, item_dir: &Utf8PathBuf) -> Result<()> {
+    if item_dir_has_deliverable_files(item_dir)? {
+        return Ok(());
+    }
+
+    let Some(status_id) = twitter_status_id_from_url(normalized)? else {
+        return Ok(());
+    };
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 notnotsavebot/0.1")
+        .build()?;
+    let html = client
+        .get(normalized)
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    if let Some(metadata) = extract_twitter_metadata(&html, &status_id) {
+        write_twitter_metadata_sidecars(item_dir, &status_id, normalized, &metadata)?;
+    }
+
+    let image_urls = extract_twitter_image_urls(&html);
+    if image_urls.is_empty() {
+        bail!("Twitter/X post did not expose image URLs");
+    }
+
+    for (index, image_url) in image_urls.iter().enumerate() {
+        let response = client
+            .get(image_url)
+            .header(reqwest::header::REFERER, normalized)
+            .send()
+            .await?
+            .error_for_status()?;
+        if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE)
+            && !content_type
+                .to_str()
+                .unwrap_or_default()
+                .starts_with("image/")
+        {
+            bail!(
+                "Twitter/X image URL returned non-image content type: {}",
+                content_type.to_str().unwrap_or("<invalid content type>")
+            );
+        }
+        let extension = image_extension_from_url(image_url);
+        let output_path = item_dir.join(format!("twitter-image-{:02}.{extension}", index + 1));
+        fs::write(output_path, response.bytes().await?)?;
+    }
+
+    Ok(())
+}
+
+fn should_continue_with_twitter_image_fallback(normalized: &str, stderr: &str) -> bool {
+    stderr.contains("No video could be found in this tweet")
+        && twitter_status_id_from_url(normalized)
             .ok()
             .flatten()
             .is_some()
@@ -1369,6 +1450,198 @@ fn instagram_shortcode_from_url(normalized: &str) -> Result<Option<String>> {
         }
         _ => Ok(None),
     }
+}
+
+fn twitter_status_id_from_url(normalized: &str) -> Result<Option<String>> {
+    let url = Url::parse(normalized)?;
+    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    if !matches!(
+        host.as_str(),
+        "x.com" | "www.x.com" | "twitter.com" | "www.twitter.com"
+    ) {
+        return Ok(None);
+    }
+
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    for window in segments.windows(2) {
+        if matches!(window[0], "status" | "statuses")
+            && !window[1].is_empty()
+            && window[1].chars().all(|ch| ch.is_ascii_digit())
+        {
+            return Ok(Some(window[1].to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn write_twitter_metadata_sidecars(
+    item_dir: &Utf8PathBuf,
+    status_id: &str,
+    normalized: &str,
+    metadata: &TwitterPostMetadata,
+) -> Result<()> {
+    let mut info = Map::new();
+    info.insert("id".into(), Value::String(status_id.to_string()));
+    info.insert("extractor_key".into(), Value::String("Twitter".into()));
+    info.insert("extractor".into(), Value::String("twitter".into()));
+    info.insert("webpage_url".into(), Value::String(normalized.to_string()));
+    info.insert("webpage_url_domain".into(), Value::String("x.com".into()));
+    info.insert(
+        "channel".into(),
+        Value::String(metadata.source_name.clone()),
+    );
+    info.insert("title".into(), Value::String(metadata.text.clone()));
+
+    if let Some(handle) = &metadata.source_handle {
+        info.insert("uploader".into(), Value::String(handle.clone()));
+        info.insert("uploader_id".into(), Value::String(handle.clone()));
+    } else {
+        info.insert(
+            "uploader".into(),
+            Value::String(metadata.source_name.clone()),
+        );
+    }
+    if let Some(timestamp) = metadata.timestamp {
+        info.insert("timestamp".into(), Value::Number(timestamp.into()));
+    }
+
+    let info_path = item_dir.join(format!("twitter-{status_id}.info.json"));
+    fs::write(info_path, serde_json::to_vec_pretty(&Value::Object(info))?)?;
+
+    let description_path = item_dir.join(format!("twitter-{status_id}.description"));
+    fs::write(description_path, "")?;
+
+    Ok(())
+}
+
+fn extract_twitter_metadata(html: &str, status_id: &str) -> Option<TwitterPostMetadata> {
+    let state = extract_twitter_initial_state(html)?;
+    let tweet = state.pointer(&format!("/entities/tweets/entities/{status_id}"))?;
+    let user_id = tweet.get("user").and_then(Value::as_str);
+    let user =
+        user_id.and_then(|user_id| state.pointer(&format!("/entities/users/entities/{user_id}")));
+
+    let source_name = user
+        .and_then(|user| user.get("name"))
+        .and_then(Value::as_str)
+        .map(decode_twitter_text)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    let source_handle = user
+        .and_then(|user| user.get("screen_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|handle| !handle.is_empty())
+        .map(|handle| format!("@{handle}"));
+    let timestamp = tweet
+        .get("created_at")
+        .and_then(Value::as_str)
+        .and_then(|created_at| DateTime::parse_from_rfc3339(created_at).ok())
+        .map(|created_at| created_at.timestamp());
+    let text = twitter_visible_text(tweet)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "untitled".into());
+
+    Some(TwitterPostMetadata {
+        source_name,
+        source_handle,
+        timestamp,
+        text,
+    })
+}
+
+fn extract_twitter_initial_state(html: &str) -> Option<Value> {
+    let marker = "window.__INITIAL_STATE__=";
+    let start = html.find(marker)? + marker.len();
+    let mut deserializer = serde_json::Deserializer::from_str(&html[start..]);
+    Value::deserialize(&mut deserializer).ok()
+}
+
+fn twitter_visible_text(tweet: &Value) -> Option<String> {
+    let raw = tweet
+        .get("full_text")
+        .or_else(|| tweet.get("text"))
+        .and_then(Value::as_str)?;
+    let text = if let Some(range) = tweet.get("display_text_range").and_then(Value::as_array) {
+        let start = range.first().and_then(Value::as_u64).unwrap_or_default() as usize;
+        let end = range
+            .get(1)
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| raw.chars().count() as u64) as usize;
+        raw.chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect::<String>()
+    } else {
+        raw.to_string()
+    };
+    Some(decode_twitter_text(&text))
+}
+
+fn decode_twitter_text(input: &str) -> String {
+    input
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .trim()
+        .to_string()
+}
+
+fn extract_twitter_image_urls(html: &str) -> Vec<String> {
+    const PATTERN: &str = r#""media_url_https":""#;
+
+    let mut urls = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find(PATTERN) {
+        let value_start = start + PATTERN.len();
+        let value = &rest[value_start..];
+        let Some(end) = value.find('"') else {
+            break;
+        };
+        let media_url = decode_instagram_embed_url(&value[..end]);
+        if let Some(original_url) = twitter_original_image_url(&media_url)
+            && !urls.iter().any(|existing| existing == &original_url)
+        {
+            urls.push(original_url);
+        }
+        rest = &value[end + 1..];
+    }
+    urls
+}
+
+fn twitter_original_image_url(media_url: &str) -> Option<String> {
+    let mut url = Url::parse(media_url).ok()?;
+    if url.host_str()? != "pbs.twimg.com" {
+        return None;
+    }
+    if !url.path().starts_with("/media/") {
+        return None;
+    }
+
+    let extension = url
+        .path_segments()?
+        .next_back()?
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())?;
+    let format = match extension.as_str() {
+        "jpg" | "jpeg" => "jpg",
+        "png" => "png",
+        "webp" => "webp",
+        _ => return None,
+    };
+
+    url.set_query(None);
+    url.query_pairs_mut()
+        .append_pair("format", format)
+        .append_pair("name", "orig");
+    Some(url.to_string())
 }
 
 fn extract_instagram_sidecar_image_urls(html: &str) -> Vec<String> {
@@ -1708,7 +1981,7 @@ fn read_delivery_filename_metadata(dir: &Utf8PathBuf) -> DeliveryFilenameMetadat
         platform_name,
         source_name,
         source_handle,
-        date: read_upload_date(&info).unwrap_or_else(current_delivery_date),
+        date: read_upload_date(&info).unwrap_or_default(),
         title: read_string_field(&info, &["title", "fulltitle", "alt_title"])
             .unwrap_or_else(|| "untitled".into()),
     }
@@ -1885,10 +2158,6 @@ fn format_compact_date(input: &str) -> Option<String> {
         &input[4..6],
         &input[6..8]
     ))
-}
-
-fn current_delivery_date() -> String {
-    Utc::now().format("%Y.%m.%d").to_string()
 }
 
 async fn run_yt_dlp_download(
@@ -2478,6 +2747,98 @@ mod tests {
                 .as_deref(),
             Some("C2jWM5qM0SJ")
         );
+    }
+
+    #[test]
+    fn extracts_twitter_metadata_from_initial_state() {
+        let html = r#"
+            window.__INITIAL_STATE__={"entities":{"users":{"entities":{"1542461":{
+              "name":"Peter &amp; Friends",
+              "screen_name":"notpeter"
+            }}},"tweets":{"entities":{"1837259033054453894":{
+              "full_text":"They literally made signs. https://t.co/voxvxhPSHN",
+              "display_text_range":[0,26],
+              "created_at":"2024-09-20T22:34:22.000Z",
+              "user":"1542461"
+            }}}}};
+        "#;
+
+        assert_eq!(
+            extract_twitter_metadata(html, "1837259033054453894"),
+            Some(TwitterPostMetadata {
+                source_name: "Peter & Friends".into(),
+                source_handle: Some("@notpeter".into()),
+                timestamp: Some(1726871662),
+                text: "They literally made signs.".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_upload_date_stays_empty() {
+        let dir = std::env::temp_dir().join(format!("notnotsavebot-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let dir = Utf8PathBuf::from_path_buf(dir).unwrap();
+
+        let metadata = read_delivery_filename_metadata(&dir);
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(metadata.date, "");
+    }
+
+    #[test]
+    fn extracts_twitter_image_urls_from_initial_state() {
+        let html = r#"
+            window.__INITIAL_STATE__={"entities":{"tweets":{"entities":{"1":{
+              "entities":{"media":[{"media_url_https":"https://pbs.twimg.com/media/one.jpg"}]},
+              "extended_entities":{"media":[
+                {"media_url_https":"https://pbs.twimg.com/media/one.jpg"},
+                {"media_url_https":"https://pbs.twimg.com/media/two.png"}
+              ]}
+            }}}}};
+        "#;
+
+        assert_eq!(
+            extract_twitter_image_urls(html),
+            vec![
+                "https://pbs.twimg.com/media/one.jpg?format=jpg&name=orig",
+                "https://pbs.twimg.com/media/two.png?format=png&name=orig",
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_twitter_status_ids() {
+        assert_eq!(
+            twitter_status_id_from_url("https://x.com/notpeter/status/1837259033054453894")
+                .unwrap()
+                .as_deref(),
+            Some("1837259033054453894")
+        );
+        assert_eq!(
+            twitter_status_id_from_url("https://twitter.com/i/web/status/1739889150990438752")
+                .unwrap()
+                .as_deref(),
+            Some("1739889150990438752")
+        );
+        assert_eq!(
+            twitter_status_id_from_url("https://example.com/notpeter/status/1837259033054453894")
+                .unwrap()
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn continues_to_twitter_image_fallback_for_photo_post_errors() {
+        assert!(should_continue_with_twitter_image_fallback(
+            "https://x.com/notpeter/status/1837259033054453894",
+            "ERROR: [twitter] 1837259033054453894: No video could be found in this tweet"
+        ));
+        assert!(!should_continue_with_twitter_image_fallback(
+            "https://example.com/notpeter/status/1837259033054453894",
+            "ERROR: [twitter] 1837259033054453894: No video could be found in this tweet"
+        ));
     }
 
     #[test]
