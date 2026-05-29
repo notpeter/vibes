@@ -183,6 +183,30 @@ struct TwitterPostMetadata {
     text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstagramPostMetadata {
+    source_name: String,
+    source_handle: Option<String>,
+    timestamp: Option<i64>,
+    title: String,
+    caption: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlueskyPostRef {
+    handle: String,
+    rkey: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlueskyPostMetadata {
+    source_name: String,
+    source_handle: Option<String>,
+    timestamp: Option<i64>,
+    title: String,
+    text: String,
+}
+
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Available commands:")]
 enum AdminTelegramCommand {
@@ -1123,6 +1147,11 @@ async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResp
                 "yt-dlp could not download Twitter/X post directly; trying image fallback: {}",
                 stderr
             );
+        } else if should_continue_with_bluesky_image_fallback(&normalized, &stderr) {
+            warn!(
+                "yt-dlp could not download Bluesky post directly; trying image fallback: {}",
+                stderr
+            );
         } else if stderr.is_empty() {
             return Err(anyhow!("yt-dlp failed with status: {}", output.status));
         } else {
@@ -1138,6 +1167,7 @@ async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResp
     let normalize_started = Instant::now();
     download_instagram_embed_images_if_needed(&normalized, &item_dir).await?;
     download_twitter_images_if_needed(&normalized, &item_dir).await?;
+    download_bluesky_images_if_needed(&normalized, &item_dir).await?;
     let filename_metadata = read_delivery_filename_metadata(&item_dir);
     let files = collect_delivery_files(&item_dir, &filename_metadata).await?;
     let convert_ms = normalize_started.elapsed().as_millis() as i64;
@@ -1199,7 +1229,16 @@ async fn download_instagram_embed_images_if_needed(
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 notnotsavebot/0.1")
         .build()?;
-    let mut image_urls = fetch_instagram_graphql_image_urls(&client, &shortcode).await?;
+    let graphql_media = fetch_instagram_graphql_media(&client, &shortcode).await?;
+    if let Some(media) = &graphql_media
+        && let Some(metadata) = extract_instagram_metadata(media)
+    {
+        write_instagram_metadata_sidecars(item_dir, &shortcode, normalized, &metadata)?;
+    }
+    let mut image_urls = graphql_media
+        .as_ref()
+        .map(extract_instagram_graphql_image_urls)
+        .unwrap_or_default();
 
     if image_urls.is_empty()
         && let Some(embed_url) = instagram_embed_url(normalized)?
@@ -1319,10 +1358,239 @@ fn should_continue_with_twitter_image_fallback(normalized: &str, stderr: &str) -
             .is_some()
 }
 
-async fn fetch_instagram_graphql_image_urls(
+async fn download_bluesky_images_if_needed(normalized: &str, item_dir: &Utf8PathBuf) -> Result<()> {
+    if item_dir_has_deliverable_files(item_dir)? {
+        return Ok(());
+    }
+
+    let Some(post_ref) = bluesky_post_ref_from_url(normalized)? else {
+        return Ok(());
+    };
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 notnotsavebot/0.1")
+        .build()?;
+    let did = resolve_bluesky_handle(&client, &post_ref.handle).await?;
+    let post_uri = format!("at://{did}/app.bsky.feed.post/{}", post_ref.rkey);
+    let post = fetch_bluesky_post(&client, &post_uri).await?;
+
+    if let Some(metadata) = extract_bluesky_metadata(&post) {
+        write_bluesky_metadata_sidecars(item_dir, &post_ref.rkey, normalized, &metadata)?;
+    }
+
+    let image_urls = extract_bluesky_image_urls(&post);
+    if image_urls.is_empty() {
+        bail!("Bluesky post did not expose image URLs");
+    }
+
+    for (index, image_url) in image_urls.iter().enumerate() {
+        let response = client
+            .get(image_url)
+            .header(reqwest::header::REFERER, normalized)
+            .send()
+            .await?
+            .error_for_status()?;
+        if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE)
+            && !content_type
+                .to_str()
+                .unwrap_or_default()
+                .starts_with("image/")
+        {
+            bail!(
+                "Bluesky image URL returned non-image content type: {}",
+                content_type.to_str().unwrap_or("<invalid content type>")
+            );
+        }
+        let extension = image_extension_from_url(image_url);
+        let output_path = item_dir.join(format!("bluesky-image-{:02}.{extension}", index + 1));
+        fs::write(output_path, response.bytes().await?)?;
+    }
+
+    Ok(())
+}
+
+fn should_continue_with_bluesky_image_fallback(normalized: &str, stderr: &str) -> bool {
+    stderr.contains("No video could be found in this post")
+        && bluesky_post_ref_from_url(normalized)
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+fn bluesky_post_ref_from_url(normalized: &str) -> Result<Option<BlueskyPostRef>> {
+    let url = Url::parse(normalized)?;
+    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    if host != "bsky.app" && host != "www.bsky.app" {
+        return Ok(None);
+    }
+
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    match segments.as_slice() {
+        ["profile", handle, "post", rkey, ..] if !handle.is_empty() && !rkey.is_empty() => {
+            Ok(Some(BlueskyPostRef {
+                handle: (*handle).to_string(),
+                rkey: (*rkey).to_string(),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+async fn resolve_bluesky_handle(client: &reqwest::Client, handle: &str) -> Result<String> {
+    let mut url =
+        Url::parse("https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle")?;
+    url.query_pairs_mut().append_pair("handle", handle);
+
+    let payload: Value = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    payload
+        .get("did")
+        .and_then(Value::as_str)
+        .filter(|did| !did.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("Bluesky handle did not resolve to a DID: {handle}"))
+}
+
+async fn fetch_bluesky_post(client: &reqwest::Client, post_uri: &str) -> Result<Value> {
+    let mut url = Url::parse("https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread")?;
+    url.query_pairs_mut()
+        .append_pair("uri", post_uri)
+        .append_pair("depth", "0");
+
+    let payload: Value = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    payload
+        .pointer("/thread/post")
+        .cloned()
+        .ok_or_else(|| anyhow!("Bluesky post response did not include thread.post"))
+}
+
+fn extract_bluesky_image_urls(post: &Value) -> Vec<String> {
+    let Some(images) = post.pointer("/embed/images").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut urls = Vec::new();
+    for image in images {
+        if let Some(url) = image.get("fullsize").and_then(Value::as_str)
+            && is_bluesky_image_url(url)
+            && !urls.iter().any(|existing| existing == url)
+        {
+            urls.push(url.to_string());
+        }
+    }
+    urls
+}
+
+fn is_bluesky_image_url(url: &str) -> bool {
+    Url::parse(url).ok().is_some_and(|url| {
+        url.host_str() == Some("cdn.bsky.app") && url.path().starts_with("/img/feed_fullsize/")
+    })
+}
+
+fn extract_bluesky_metadata(post: &Value) -> Option<BlueskyPostMetadata> {
+    let author = post.get("author");
+    let handle = author
+        .and_then(|author| author.get("handle"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|handle| !handle.is_empty());
+    let source_name = author
+        .and_then(|author| author.get("displayName"))
+        .and_then(Value::as_str)
+        .map(decode_twitter_text)
+        .filter(|name| !name.is_empty())
+        .or_else(|| handle.map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".into());
+    let source_handle = handle.map(|handle| format!("@{handle}"));
+    let text = post
+        .pointer("/record/text")
+        .and_then(Value::as_str)
+        .map(decode_twitter_text)
+        .unwrap_or_default();
+    let title = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "untitled".into());
+    let timestamp = post
+        .pointer("/record/createdAt")
+        .and_then(Value::as_str)
+        .and_then(|created_at| DateTime::parse_from_rfc3339(created_at).ok())
+        .map(|created_at| created_at.timestamp());
+
+    Some(BlueskyPostMetadata {
+        source_name,
+        source_handle,
+        timestamp,
+        title,
+        text,
+    })
+}
+
+fn write_bluesky_metadata_sidecars(
+    item_dir: &Utf8PathBuf,
+    rkey: &str,
+    normalized: &str,
+    metadata: &BlueskyPostMetadata,
+) -> Result<()> {
+    let mut info = Map::new();
+    info.insert("id".into(), Value::String(rkey.to_string()));
+    info.insert("extractor_key".into(), Value::String("Bluesky".into()));
+    info.insert("extractor".into(), Value::String("Bluesky".into()));
+    info.insert("webpage_url".into(), Value::String(normalized.to_string()));
+    info.insert(
+        "webpage_url_domain".into(),
+        Value::String("bsky.app".into()),
+    );
+    info.insert(
+        "channel".into(),
+        Value::String(metadata.source_name.clone()),
+    );
+    info.insert("title".into(), Value::String(metadata.title.clone()));
+
+    if let Some(handle) = &metadata.source_handle {
+        info.insert("uploader".into(), Value::String(handle.clone()));
+        info.insert("uploader_id".into(), Value::String(handle.clone()));
+    } else {
+        info.insert(
+            "uploader".into(),
+            Value::String(metadata.source_name.clone()),
+        );
+    }
+    if let Some(timestamp) = metadata.timestamp {
+        info.insert("timestamp".into(), Value::Number(timestamp.into()));
+    }
+
+    let info_path = item_dir.join(format!("bluesky-{rkey}.info.json"));
+    fs::write(info_path, serde_json::to_vec_pretty(&Value::Object(info))?)?;
+
+    let description_path = item_dir.join(format!("bluesky-{rkey}.description"));
+    fs::write(description_path, metadata.text.as_bytes())?;
+
+    Ok(())
+}
+
+async fn fetch_instagram_graphql_media(
     client: &reqwest::Client,
     shortcode: &str,
-) -> Result<Vec<String>> {
+) -> Result<Option<Value>> {
     let mut url = Url::parse("https://www.instagram.com/graphql/query")?;
     url.query_pairs_mut()
         .append_pair("doc_id", "8845758582119845")
@@ -1336,10 +1604,104 @@ async fn fetch_instagram_graphql_image_urls(
         .error_for_status()?
         .json()
         .await?;
-    let Some(media) = payload.pointer("/data/xdt_shortcode_media") else {
-        return Ok(Vec::new());
-    };
-    Ok(extract_instagram_graphql_image_urls(media))
+    Ok(payload.pointer("/data/xdt_shortcode_media").cloned())
+}
+
+fn write_instagram_metadata_sidecars(
+    item_dir: &Utf8PathBuf,
+    shortcode: &str,
+    normalized: &str,
+    metadata: &InstagramPostMetadata,
+) -> Result<()> {
+    let mut info = Map::new();
+    info.insert("id".into(), Value::String(shortcode.to_string()));
+    info.insert("extractor_key".into(), Value::String("Instagram".into()));
+    info.insert("extractor".into(), Value::String("instagram".into()));
+    info.insert("webpage_url".into(), Value::String(normalized.to_string()));
+    info.insert(
+        "webpage_url_domain".into(),
+        Value::String("instagram.com".into()),
+    );
+    info.insert(
+        "channel".into(),
+        Value::String(metadata.source_name.clone()),
+    );
+    info.insert("title".into(), Value::String(metadata.title.clone()));
+
+    if let Some(handle) = &metadata.source_handle {
+        info.insert("uploader".into(), Value::String(handle.clone()));
+        info.insert("uploader_id".into(), Value::String(handle.clone()));
+    } else {
+        info.insert(
+            "uploader".into(),
+            Value::String(metadata.source_name.clone()),
+        );
+    }
+    if let Some(timestamp) = metadata.timestamp {
+        info.insert("timestamp".into(), Value::Number(timestamp.into()));
+    }
+
+    let info_path = item_dir.join(format!("instagram-{shortcode}.info.json"));
+    fs::write(info_path, serde_json::to_vec_pretty(&Value::Object(info))?)?;
+
+    let description_path = item_dir.join(format!("instagram-{shortcode}.description"));
+    fs::write(description_path, metadata.caption.as_bytes())?;
+
+    Ok(())
+}
+
+fn extract_instagram_metadata(media: &Value) -> Option<InstagramPostMetadata> {
+    let owner = media.get("owner");
+    let username = owner
+        .and_then(|owner| owner.get("username"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|username| !username.is_empty());
+    let source_name = owner
+        .and_then(|owner| owner.get("full_name"))
+        .and_then(Value::as_str)
+        .map(decode_twitter_text)
+        .filter(|name| !name.is_empty())
+        .or_else(|| username.map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".into());
+    let source_handle = username.map(|username| format!("@{username}"));
+    let timestamp = media.get("taken_at_timestamp").and_then(Value::as_i64);
+    let caption = instagram_caption_text(media).unwrap_or_default();
+    let title = instagram_title(media, &caption);
+
+    Some(InstagramPostMetadata {
+        source_name,
+        source_handle,
+        timestamp,
+        title,
+        caption,
+    })
+}
+
+fn instagram_caption_text(media: &Value) -> Option<String> {
+    media
+        .pointer("/edge_media_to_caption/edges")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|edge| edge.pointer("/node/text").and_then(Value::as_str))
+        .map(decode_twitter_text)
+        .find(|caption| !caption.is_empty())
+}
+
+fn instagram_title(media: &Value, caption: &str) -> String {
+    caption
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            media
+                .get("accessibility_caption")
+                .and_then(Value::as_str)
+                .map(decode_twitter_text)
+                .filter(|title| !title.is_empty())
+        })
+        .unwrap_or_else(|| "untitled".into())
 }
 
 fn extract_instagram_graphql_image_urls(media: &Value) -> Vec<String> {
@@ -2038,6 +2400,9 @@ fn normalize_platform_name(raw: &str) -> String {
     if lower.contains("tiktok") {
         return "TikTok".into();
     }
+    if lower.contains("bluesky") || lower.contains("bsky") {
+        return "Bluesky".into();
+    }
     if lower.contains("twitter") || lower == "x" || lower.contains("x.com") {
         return "X".into();
     }
@@ -2692,6 +3057,123 @@ fn insert_media_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_bluesky_post_refs() {
+        assert_eq!(
+            bluesky_post_ref_from_url(
+                "https://bsky.app/profile/notpeter.bsky.social/post/3mjcw2b6ajk25"
+            )
+            .unwrap(),
+            Some(BlueskyPostRef {
+                handle: "notpeter.bsky.social".into(),
+                rkey: "3mjcw2b6ajk25".into(),
+            })
+        );
+        assert_eq!(
+            bluesky_post_ref_from_url(
+                "https://example.com/profile/notpeter.bsky.social/post/3mjcw2b6ajk25"
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn extracts_bluesky_image_urls() {
+        let post = serde_json::json!({
+            "embed": {"images": [
+                {"fullsize": "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:test/one"},
+                {"fullsize": "https://cdn.bsky.app/img/feed_thumbnail/plain/did:plc:test/ignored"},
+                {"fullsize": "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:test/two"},
+                {"fullsize": "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:test/one"}
+            ]}
+        });
+
+        assert_eq!(
+            extract_bluesky_image_urls(&post),
+            vec![
+                "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:test/one",
+                "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:test/two",
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_bluesky_metadata() {
+        let post = serde_json::json!({
+            "author": {
+                "handle": "notpeter.bsky.social",
+                "displayName": "Peter &amp; Friends"
+            },
+            "record": {
+                "createdAt": "2026-04-12T17:50:29.007Z",
+                "text": "Steps to reproduce:\n1. Put these two PNG images in a folder."
+            }
+        });
+
+        assert_eq!(
+            extract_bluesky_metadata(&post),
+            Some(BlueskyPostMetadata {
+                source_name: "Peter & Friends".into(),
+                source_handle: Some("@notpeter.bsky.social".into()),
+                timestamp: Some(1776016229),
+                title: "Steps to reproduce:".into(),
+                text: "Steps to reproduce:\n1. Put these two PNG images in a folder.".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn continues_to_bluesky_image_fallback_for_photo_post_errors() {
+        assert!(should_continue_with_bluesky_image_fallback(
+            "https://bsky.app/profile/notpeter.bsky.social/post/3mjcw2b6ajk25",
+            "ERROR: [Bluesky] 3mjcw2b6ajk25: No video could be found in this post"
+        ));
+        assert!(!should_continue_with_bluesky_image_fallback(
+            "https://example.com/profile/notpeter.bsky.social/post/3mjcw2b6ajk25",
+            "ERROR: [Bluesky] 3mjcw2b6ajk25: No video could be found in this post"
+        ));
+    }
+
+    #[test]
+    fn extracts_instagram_metadata_from_graphql_media() {
+        let media = serde_json::json!({
+            "owner": {
+                "username": "notpeter",
+                "full_name": "Peter &amp; Friends"
+            },
+            "taken_at_timestamp": 1706248090,
+            "accessibility_caption": "fallback title",
+            "edge_media_to_caption": {"edges": [{"node": {
+                "text": "First line title\n\nRest of caption &amp; details"
+            }}]}
+        });
+
+        assert_eq!(
+            extract_instagram_metadata(&media),
+            Some(InstagramPostMetadata {
+                source_name: "Peter & Friends".into(),
+                source_handle: Some("@notpeter".into()),
+                timestamp: Some(1706248090),
+                title: "First line title".into(),
+                caption: "First line title\n\nRest of caption & details".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn uses_instagram_accessibility_caption_when_caption_is_missing() {
+        let media = serde_json::json!({
+            "owner": {"username": "notpeter"},
+            "accessibility_caption": "iHome HT160B Hilton Alarm Clock."
+        });
+
+        assert_eq!(
+            extract_instagram_metadata(&media).map(|metadata| metadata.title),
+            Some("iHome HT160B Hilton Alarm Clock.".into())
+        );
+    }
 
     #[test]
     fn extracts_largest_graphql_image_for_single_post() {
