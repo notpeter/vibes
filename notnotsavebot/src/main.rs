@@ -1178,31 +1178,36 @@ async fn download_instagram_embed_images_if_needed(
         return Ok(());
     }
 
-    let Some(embed_url) = instagram_embed_url(normalized)? else {
+    let Some(shortcode) = instagram_shortcode_from_url(normalized)? else {
         return Ok(());
     };
 
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 notnotsavebot/0.1")
         .build()?;
-    let html = client
-        .get(embed_url.as_str())
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    let image_urls = extract_instagram_sidecar_image_urls(&html);
+    let mut image_urls = fetch_instagram_graphql_image_urls(&client, &shortcode).await?;
+
+    if image_urls.is_empty()
+        && let Some(embed_url) = instagram_embed_url(normalized)?
+    {
+        let html = client
+            .get(embed_url.as_str())
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        image_urls = extract_instagram_sidecar_image_urls(&html);
+    }
+
     if image_urls.is_empty() {
-        bail!(
-            "Instagram post did not expose uncropped image URLs; refusing to use cropped preview metadata"
-        );
+        bail!("Instagram post did not expose uncropped image URLs");
     }
 
     for (index, image_url) in image_urls.iter().enumerate() {
         let response = client
             .get(image_url)
-            .header(reqwest::header::REFERER, embed_url.as_str())
+            .header(reqwest::header::REFERER, normalized)
             .send()
             .await?
             .error_for_status()?;
@@ -1213,7 +1218,7 @@ async fn download_instagram_embed_images_if_needed(
                 .starts_with("image/")
         {
             bail!(
-                "Instagram embed image URL returned non-image content type: {}",
+                "Instagram image URL returned non-image content type: {}",
                 content_type.to_str().unwrap_or("<invalid content type>")
             );
         }
@@ -1227,7 +1232,88 @@ async fn download_instagram_embed_images_if_needed(
 
 fn should_continue_with_instagram_embed_fallback(normalized: &str, stderr: &str) -> bool {
     should_retry_without_video_format(stderr)
-        && instagram_embed_url(normalized).ok().flatten().is_some()
+        && instagram_shortcode_from_url(normalized)
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+async fn fetch_instagram_graphql_image_urls(
+    client: &reqwest::Client,
+    shortcode: &str,
+) -> Result<Vec<String>> {
+    let mut url = Url::parse("https://www.instagram.com/graphql/query")?;
+    url.query_pairs_mut()
+        .append_pair("doc_id", "8845758582119845")
+        .append_pair("variables", &format!(r#"{{"shortcode":"{shortcode}"}}"#));
+
+    let payload: Value = client
+        .get(url)
+        .header("X-IG-App-ID", "936619743392459")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let Some(media) = payload.pointer("/data/xdt_shortcode_media") else {
+        return Ok(Vec::new());
+    };
+    Ok(extract_instagram_graphql_image_urls(media))
+}
+
+fn extract_instagram_graphql_image_urls(media: &Value) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(edges) = media
+        .pointer("/edge_sidecar_to_children/edges")
+        .and_then(Value::as_array)
+    {
+        for node in edges.iter().filter_map(|edge| edge.get("node")) {
+            push_instagram_graphql_image_url(node, &mut urls);
+        }
+    } else {
+        push_instagram_graphql_image_url(media, &mut urls);
+    }
+    urls
+}
+
+fn push_instagram_graphql_image_url(media: &Value, urls: &mut Vec<String>) {
+    if media.get("is_video").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+
+    let best_resource = media
+        .get("display_resources")
+        .and_then(Value::as_array)
+        .and_then(|resources| {
+            resources.iter().max_by_key(|resource| {
+                let width = resource
+                    .get("config_width")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let height = resource
+                    .get("config_height")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                width.saturating_mul(height)
+            })
+        })
+        .and_then(|resource| resource.get("src"))
+        .and_then(Value::as_str);
+    let url = best_resource.or_else(|| media.get("display_url").and_then(Value::as_str));
+    if let Some(url) = url
+        && is_instagram_media_image_url(url)
+        && !urls.iter().any(|existing| existing == url)
+    {
+        urls.push(url.to_string());
+    }
+}
+
+fn is_instagram_media_image_url(url: &str) -> bool {
+    Url::parse(url).ok().is_some_and(|url| {
+        url.host_str()
+            .is_some_and(|host| host.ends_with("cdninstagram.com") || host.ends_with("fbcdn.net"))
+            && url.path().contains("/v/t51.")
+    })
 }
 
 fn item_dir_has_deliverable_files(item_dir: &Utf8PathBuf) -> Result<bool> {
@@ -1244,24 +1330,10 @@ fn item_dir_has_deliverable_files(item_dir: &Utf8PathBuf) -> Result<bool> {
 }
 
 fn instagram_embed_url(normalized: &str) -> Result<Option<Url>> {
-    let url = Url::parse(normalized)?;
-    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+    let Some(shortcode) = instagram_shortcode_from_url(normalized)? else {
         return Ok(None);
     };
-    if host != "instagram.com" && host != "www.instagram.com" {
-        return Ok(None);
-    }
-
-    let mut segments = url
-        .path_segments()
-        .map(|segments| segments.collect::<Vec<_>>())
-        .unwrap_or_default();
-    if !matches!(segments.as_slice(), ["p", shortcode, ..] if !shortcode.is_empty()) {
-        return Ok(None);
-    }
-
-    segments.truncate(2);
-    segments.push("embed");
+    let segments = ["p", shortcode.as_str(), "embed"];
     let mut embed_url = Url::parse("https://www.instagram.com/")?;
     {
         let mut output_segments = embed_url
@@ -1273,6 +1345,30 @@ fn instagram_embed_url(normalized: &str) -> Result<Option<Url>> {
         }
     }
     Ok(Some(embed_url))
+}
+
+fn instagram_shortcode_from_url(normalized: &str) -> Result<Option<String>> {
+    let url = Url::parse(normalized)?;
+    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    if host != "instagram.com" && host != "www.instagram.com" {
+        return Ok(None);
+    }
+
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    match segments.as_slice() {
+        ["p" | "reel" | "tv", shortcode, ..] if !shortcode.is_empty() => {
+            Ok(Some((*shortcode).to_string()))
+        }
+        [_, "p" | "reel" | "tv", shortcode, ..] if !shortcode.is_empty() => {
+            Ok(Some((*shortcode).to_string()))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn extract_instagram_sidecar_image_urls(html: &str) -> Vec<String> {
@@ -2327,6 +2423,62 @@ fn insert_media_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_largest_graphql_image_for_single_post() {
+        let media = serde_json::json!({
+            "__typename": "XDTGraphImage",
+            "is_video": false,
+            "display_resources": [
+                {"config_width": 640, "config_height": 800, "src": "https://scontent.example.cdninstagram.com/v/t51.82787-15/small.jpg"},
+                {"config_width": 1080, "config_height": 1350, "src": "https://scontent.example.cdninstagram.com/v/t51.82787-15/large.jpg"}
+            ]
+        });
+
+        assert_eq!(
+            extract_instagram_graphql_image_urls(&media),
+            vec!["https://scontent.example.cdninstagram.com/v/t51.82787-15/large.jpg"]
+        );
+    }
+
+    #[test]
+    fn extracts_graphql_images_for_sidecar_children() {
+        let media = serde_json::json!({
+            "__typename": "XDTGraphSidecar",
+            "edge_sidecar_to_children": {"edges": [
+                {"node": {"is_video": false, "display_url": "https://scontent.example.cdninstagram.com/v/t51.82787-15/one.jpg"}},
+                {"node": {"is_video": false, "display_resources": [
+                    {"config_width": 750, "config_height": 750, "src": "https://scontent.example.cdninstagram.com/v/t51.82787-15/two-small.jpg"},
+                    {"config_width": 1080, "config_height": 1080, "src": "https://scontent.example.cdninstagram.com/v/t51.82787-15/two-large.jpg"}
+                ]}},
+                {"node": {"is_video": true, "display_url": "https://scontent.example.cdninstagram.com/v/t51.82787-15/video-cover.jpg"}}
+            ]}
+        });
+
+        assert_eq!(
+            extract_instagram_graphql_image_urls(&media),
+            vec![
+                "https://scontent.example.cdninstagram.com/v/t51.82787-15/one.jpg",
+                "https://scontent.example.cdninstagram.com/v/t51.82787-15/two-large.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_shortcode_from_instagram_post_urls() {
+        assert_eq!(
+            instagram_shortcode_from_url("https://www.instagram.com/p/C2jWM5qM0SJ/")
+                .unwrap()
+                .as_deref(),
+            Some("C2jWM5qM0SJ")
+        );
+        assert_eq!(
+            instagram_shortcode_from_url("https://www.instagram.com/notpeter/p/C2jWM5qM0SJ/")
+                .unwrap()
+                .as_deref(),
+            Some("C2jWM5qM0SJ")
+        );
+    }
 
     #[test]
     fn extracts_instagram_sidecar_display_urls_from_embed_payload() {
