@@ -959,6 +959,7 @@ dependencies = [
  "camino",
  "chrono",
  "clap",
+ "reqwest",
  "rusqlite",
  "schemars",
  "serde",

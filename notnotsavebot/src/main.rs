@@ -1105,18 +1105,25 @@ async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResp
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
+        if should_continue_with_instagram_embed_fallback(&normalized, &stderr) {
+            warn!(
+                "yt-dlp could not download Instagram post directly; trying embed image fallback: {}",
+                stderr
+            );
+        } else if stderr.is_empty() {
             return Err(anyhow!("yt-dlp failed with status: {}", output.status));
+        } else {
+            return Err(anyhow!(
+                "yt-dlp failed with status {}: {}",
+                output.status,
+                stderr
+            ));
         }
-        return Err(anyhow!(
-            "yt-dlp failed with status {}: {}",
-            output.status,
-            stderr
-        ));
     }
     let download_ms = started.elapsed().as_millis() as i64;
 
     let normalize_started = Instant::now();
+    download_instagram_embed_images_if_needed(&normalized, &item_dir).await?;
     let filename_metadata = read_delivery_filename_metadata(&item_dir);
     let files = collect_delivery_files(&item_dir, &filename_metadata).await?;
     let convert_ms = normalize_started.elapsed().as_millis() as i64;
@@ -1135,7 +1142,7 @@ async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResp
     );
 
     let media_id = insert_media_record(
-        &config,
+        config,
         &normalized,
         &files.join(","),
         &post_text,
@@ -1161,6 +1168,174 @@ fn is_image_path(path: &str) -> bool {
         || path.ends_with(".jpeg")
         || path.ends_with(".png")
         || path.ends_with(".webp")
+}
+
+async fn download_instagram_embed_images_if_needed(
+    normalized: &str,
+    item_dir: &Utf8PathBuf,
+) -> Result<()> {
+    if item_dir_has_deliverable_files(item_dir)? {
+        return Ok(());
+    }
+
+    let Some(embed_url) = instagram_embed_url(normalized)? else {
+        return Ok(());
+    };
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 notnotsavebot/0.1")
+        .build()?;
+    let html = client
+        .get(embed_url.as_str())
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let image_urls = extract_instagram_sidecar_image_urls(&html);
+    if image_urls.is_empty() {
+        bail!(
+            "Instagram post did not expose uncropped image URLs; refusing to use cropped preview metadata"
+        );
+    }
+
+    for (index, image_url) in image_urls.iter().enumerate() {
+        let response = client
+            .get(image_url)
+            .header(reqwest::header::REFERER, embed_url.as_str())
+            .send()
+            .await?
+            .error_for_status()?;
+        if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE)
+            && !content_type
+                .to_str()
+                .unwrap_or_default()
+                .starts_with("image/")
+        {
+            bail!(
+                "Instagram embed image URL returned non-image content type: {}",
+                content_type.to_str().unwrap_or("<invalid content type>")
+            );
+        }
+        let extension = image_extension_from_url(image_url);
+        let output_path = item_dir.join(format!("instagram-sidecar-{:02}.{extension}", index + 1));
+        fs::write(output_path, response.bytes().await?)?;
+    }
+
+    Ok(())
+}
+
+fn should_continue_with_instagram_embed_fallback(normalized: &str, stderr: &str) -> bool {
+    should_retry_without_video_format(stderr)
+        && instagram_embed_url(normalized).ok().flatten().is_some()
+}
+
+fn item_dir_has_deliverable_files(item_dir: &Utf8PathBuf) -> Result<bool> {
+    for entry in fs::read_dir(item_dir)? {
+        let path = entry?.path();
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("mp4" | "jpg" | "jpeg" | "png" | "webp")
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn instagram_embed_url(normalized: &str) -> Result<Option<Url>> {
+    let url = Url::parse(normalized)?;
+    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    if host != "instagram.com" && host != "www.instagram.com" {
+        return Ok(None);
+    }
+
+    let mut segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !matches!(segments.as_slice(), ["p", shortcode, ..] if !shortcode.is_empty()) {
+        return Ok(None);
+    }
+
+    segments.truncate(2);
+    segments.push("embed");
+    let mut embed_url = Url::parse("https://www.instagram.com/")?;
+    {
+        let mut output_segments = embed_url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("unable to build Instagram embed URL"))?;
+        output_segments.clear();
+        for segment in segments {
+            output_segments.push(segment);
+        }
+    }
+    Ok(Some(embed_url))
+}
+
+fn extract_instagram_sidecar_image_urls(html: &str) -> Vec<String> {
+    let Some(sidecar_start) = html
+        .find(r#"\"edge_sidecar_to_children\""#)
+        .or_else(|| html.find(r#""edge_sidecar_to_children""#))
+    else {
+        return Vec::new();
+    };
+    let sidecar = &html[sidecar_start..];
+    let escaped = extract_instagram_urls_with_pattern(sidecar, r#"\"display_url\":\""#, r#"\""#);
+    if !escaped.is_empty() {
+        return escaped;
+    }
+    extract_instagram_urls_with_pattern(sidecar, r#""display_url":""#, r#"""#)
+}
+
+fn extract_instagram_urls_with_pattern(
+    haystack: &str,
+    start_pattern: &str,
+    end_pattern: &str,
+) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut rest = haystack;
+    while let Some(start) = rest.find(start_pattern) {
+        let value_start = start + start_pattern.len();
+        let value = &rest[value_start..];
+        let Some(end) = value.find(end_pattern) else {
+            break;
+        };
+        let url = decode_instagram_embed_url(&value[..end]);
+        if url.starts_with("https://") && !urls.contains(&url) {
+            urls.push(url);
+        }
+        rest = &value[end + end_pattern.len()..];
+    }
+    urls
+}
+
+fn decode_instagram_embed_url(input: &str) -> String {
+    input
+        .replace(r"\\/", "/")
+        .replace(r"\/", "/")
+        .replace(r"\u0026", "&")
+        .replace("&amp;", "&")
+}
+
+fn image_extension_from_url(image_url: &str) -> &'static str {
+    Url::parse(image_url)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()?
+                .next_back()?
+                .rsplit_once('.')
+                .map(|(_, extension)| extension.to_ascii_lowercase())
+        })
+        .and_then(|extension| match extension.as_str() {
+            "jpg" | "jpeg" => Some("jpg"),
+            "png" => Some("png"),
+            "webp" => Some("webp"),
+            _ => None,
+        })
+        .unwrap_or("jpg")
 }
 
 async fn collect_delivery_files(
@@ -2147,4 +2322,69 @@ fn insert_media_record(
         .map_err(anyhow::Error::from)?;
         Ok(conn.last_insert_rowid())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_instagram_sidecar_display_urls_from_embed_payload() {
+        let html = r#"
+            "edge_sidecar_to_children":{"edges":[
+              {"node":{"display_url":"https:\/\/cdn.example.com\/one.jpg?x=1&amp;y=2","display_resources":[{"src":"https:\/\/cdn.example.com\/ignored.jpg"}]}},
+              {"node":{"display_url":"https:\/\/cdn.example.com\/two.webp?x=1\u0026y=2"}},
+              {"node":{"display_url":"https:\/\/cdn.example.com\/one.jpg?x=1&amp;y=2"}}
+            ]}
+        "#;
+
+        assert_eq!(
+            extract_instagram_sidecar_image_urls(html),
+            vec![
+                "https://cdn.example.com/one.jpg?x=1&y=2",
+                "https://cdn.example.com/two.webp?x=1&y=2",
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_escaped_instagram_sidecar_display_urls_from_embed_payload() {
+        let html = r#"
+            \"edge_sidecar_to_children\":{\"edges\":[
+              {\"node\":{\"display_url\":\"https:\\/\\/cdn.example.com\\/one.jpg?x=1&amp;y=2\"}},
+              {\"node\":{\"display_url\":\"https:\\/\\/cdn.example.com\\/two.jpg?x=1\u0026y=2\"}}
+            ]}
+        "#;
+
+        assert_eq!(
+            extract_instagram_sidecar_image_urls(html),
+            vec![
+                "https://cdn.example.com/one.jpg?x=1&y=2",
+                "https://cdn.example.com/two.jpg?x=1&y=2",
+            ]
+        );
+    }
+
+    #[test]
+    fn continues_to_embed_fallback_for_instagram_photo_post_errors() {
+        assert!(should_continue_with_instagram_embed_fallback(
+            "https://www.instagram.com/p/Ce2szzFPqwO/",
+            "ERROR: [Instagram] Ce2szzFPqwO: There is no video in this post"
+        ));
+        assert!(!should_continue_with_instagram_embed_fallback(
+            "https://example.com/p/Ce2szzFPqwO/",
+            "ERROR: Requested format is not available"
+        ));
+    }
+
+    #[test]
+    fn builds_instagram_embed_url_for_posts() {
+        assert_eq!(
+            instagram_embed_url("https://www.instagram.com/p/Ccwj6xYMEoX/?utm_source=x")
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "https://www.instagram.com/p/Ccwj6xYMEoX/embed"
+        );
+    }
 }

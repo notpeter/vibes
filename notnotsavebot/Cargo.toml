@@ -17,6 +17,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 camino = { version = "1", features = ["serde1"] }
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 which = "8"
