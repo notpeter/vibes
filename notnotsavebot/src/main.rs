@@ -1,9 +1,9 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
-    sync::Arc,
-    time::Instant,
+    process::{ExitStatus, Stdio},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,7 +23,11 @@ use teloxide::{
     },
     utils::command::BotCommands,
 };
-use tokio::{process::Command as TokioCommand, task};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command as TokioCommand,
+    task,
+};
 use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -165,10 +169,122 @@ struct VideoReencodeInfo {
     audio: TargetAudioPlan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum StatusPhase {
+    FetchingLink,
+    FetchFailed,
+    DownloadingMedia,
+    DownloadFailed,
+    ConvertingMedia,
+    ConvertingFailed,
+    CompressingMediaPass1,
+    CompressingMediaPass2,
+    CompressingFailed,
+    UploadingMedia,
+    UploadFailed,
+    DownloadComplete,
+}
+
+impl StatusPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FetchingLink => "Fetching link...",
+            Self::FetchFailed => "Fetch failed.",
+            Self::DownloadingMedia => "Downloading media...",
+            Self::DownloadFailed => "Download failed.",
+            Self::ConvertingMedia => "Converting media...",
+            Self::ConvertingFailed => "Conversion failed.",
+            Self::CompressingMediaPass1 => "Compressing media... Pass 1/2",
+            Self::CompressingMediaPass2 => "Compressing media... Pass 2/2",
+            Self::CompressingFailed => "Compression failed.",
+            Self::UploadingMedia => "Uploading media...",
+            Self::UploadFailed => "Upload failed.",
+            Self::DownloadComplete => "Download complete.",
+        }
+    }
+
+    fn is_failure(self) -> bool {
+        matches!(
+            self,
+            Self::FetchFailed
+                | Self::DownloadFailed
+                | Self::ConvertingFailed
+                | Self::CompressingFailed
+                | Self::UploadFailed
+        )
+    }
+
+    fn progress_text(self, bucket: u8, display_percent: u8) -> String {
+        format!(
+            "{}\n<code>{}</code>",
+            self.label(),
+            progress_bar(bucket, display_percent)
+        )
+    }
+}
+
+struct ProgressThrottle {
+    phase: StatusPhase,
+    last_update: Option<Instant>,
+    last_display_percent: Option<u8>,
+    pending_display_percent: Option<u8>,
+}
+
+impl ProgressThrottle {
+    fn after_sent(phase: StatusPhase, display_percent: u8) -> Self {
+        Self {
+            phase,
+            last_update: Some(Instant::now()),
+            last_display_percent: Some(display_percent),
+            pending_display_percent: None,
+        }
+    }
+
+    async fn update(&mut self, progress: Option<&DownloadProgress<'_>>, percent: f64) {
+        let Some(progress) = progress else {
+            return;
+        };
+        let Some(display_percent) = progress_display_percent(percent) else {
+            return;
+        };
+        if self.last_display_percent == Some(display_percent) {
+            return;
+        }
+        if self
+            .last_update
+            .is_some_and(|last_update| last_update.elapsed() < PROGRESS_UPDATE_INTERVAL)
+        {
+            self.pending_display_percent = Some(display_percent);
+            return;
+        }
+
+        self.send_percent(progress, display_percent).await;
+    }
+
+    async fn flush(&mut self, progress: Option<&DownloadProgress<'_>>) {
+        let Some(progress) = progress else {
+            return;
+        };
+        if let Some(display_percent) = self.pending_display_percent.take()
+            && self.last_display_percent != Some(display_percent)
+        {
+            self.send_percent(progress, display_percent).await;
+        }
+    }
+
+    async fn send_percent(&mut self, progress: &DownloadProgress<'_>, display_percent: u8) {
+        self.last_update = Some(Instant::now());
+        self.last_display_percent = Some(display_percent);
+        self.pending_display_percent = None;
+        progress.set_phase_bar(self.phase, display_percent).await;
+    }
+}
+
 struct DownloadProgress<'a> {
     bot: &'a Bot,
     chat_id: ChatId,
     message_id: MessageId,
+    phase: Mutex<Option<StatusPhase>>,
 }
 
 impl<'a> DownloadProgress<'a> {
@@ -177,6 +293,33 @@ impl<'a> DownloadProgress<'a> {
             bot,
             chat_id: message.chat.id,
             message_id: message.id,
+            phase: Mutex::new(None),
+        }
+    }
+
+    async fn set_phase(&self, phase: StatusPhase) {
+        self.record_phase(phase);
+        self.set(phase.label()).await;
+    }
+
+    async fn set_phase_bar(&self, phase: StatusPhase, display_percent: u8) {
+        self.record_phase(phase);
+        let bucket = progress_bucket_from_display_percent(display_percent);
+        self.set(&phase.progress_text(bucket, display_percent))
+            .await;
+    }
+
+    fn has_failure_phase(&self) -> bool {
+        self.phase
+            .lock()
+            .ok()
+            .and_then(|phase| *phase)
+            .is_some_and(StatusPhase::is_failure)
+    }
+
+    fn record_phase(&self, phase: StatusPhase) {
+        if let Ok(mut current) = self.phase.lock() {
+            *current = Some(phase);
         }
     }
 
@@ -184,6 +327,7 @@ impl<'a> DownloadProgress<'a> {
         if let Err(err) = self
             .bot
             .edit_message_text(self.chat_id, self.message_id, text)
+            .parse_mode(ParseMode::Html)
             .await
         {
             warn!(
@@ -203,9 +347,19 @@ impl<'a> DownloadProgress<'a> {
     }
 }
 
-async fn set_download_progress(progress: Option<&DownloadProgress<'_>>, text: &str) {
+async fn set_download_progress(progress: Option<&DownloadProgress<'_>>, phase: StatusPhase) {
     if let Some(progress) = progress {
-        progress.set(text).await;
+        progress.set_phase(phase).await;
+    }
+}
+
+async fn set_download_progress_bar(
+    progress: Option<&DownloadProgress<'_>>,
+    phase: StatusPhase,
+    display_percent: u8,
+) {
+    if let Some(progress) = progress {
+        progress.set_phase_bar(phase, display_percent).await;
     }
 }
 
@@ -316,6 +470,8 @@ const TELEGRAM_COPY_AUDIO_MAX_BITRATE_BPS: u64 = 131_000;
 const TELEGRAM_REENCODE_CONTAINER_OVERHEAD_BPS: u64 = 64_000;
 const TELEGRAM_REENCODE_MIN_VIDEO_BITRATE_BPS: u64 = 150_000;
 const TELEGRAM_UPLOAD_LIMIT_LABEL: &str = "50 MB";
+const PROGRESS_BAR_WIDTH: usize = 20;
+const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 enum AuthorizationTarget {
@@ -1041,18 +1197,21 @@ async fn handle_download_request(
     config: &Config,
     input: &str,
 ) -> ResponseResult<()> {
-    let status = bot.send_message(msg.chat.id, "Fetching link...").await?;
+    let status = bot
+        .send_message(msg.chat.id, StatusPhase::FetchingLink.label())
+        .await?;
     let progress = DownloadProgress::new(bot, &status);
 
     let download = download_media(config, input, Some(&progress)).await;
     match download {
         Ok(media) => {
-            progress.set("Download complete.").await;
-            if let Err(e) = send_download_result(bot, msg, media).await {
+            progress.set_phase(StatusPhase::DownloadComplete).await;
+            if let Err(e) = send_download_result(bot, msg, media, Some(&progress)).await {
                 error!(
                     "download delivery failed for chat {} input {:?}: {e:#}",
                     msg.chat.id.0, input
                 );
+                progress.set_phase(StatusPhase::UploadFailed).await;
                 if let Err(notify_error) = send_delivery_error_notice(bot, msg, &e).await {
                     error!(
                         "failed to notify chat {} after delivery error: {notify_error:#}",
@@ -1068,7 +1227,9 @@ async fn handle_download_request(
                 "download request failed for chat {} input {:?}: {e:#}",
                 msg.chat.id.0, input
             );
-            progress.set("Download failed.").await;
+            if !progress.has_failure_phase() {
+                progress.set_phase(StatusPhase::DownloadFailed).await;
+            }
             bot.send_message(msg.chat.id, format!("Download failed: {e:#}"))
                 .await?;
         }
@@ -1081,6 +1242,7 @@ async fn send_download_result(
     bot: &Bot,
     msg: &Message,
     media: DownloadResponse,
+    progress: Option<&DownloadProgress<'_>>,
 ) -> ResponseResult<()> {
     bot.send_message(
         msg.chat.id,
@@ -1113,9 +1275,11 @@ async fn send_download_result(
         }
 
         if is_image_path(file) {
+            set_download_progress(progress, StatusPhase::UploadingMedia).await;
             bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(file)))
                 .await?;
         } else {
+            set_download_progress(progress, StatusPhase::UploadingMedia).await;
             let mut request = bot.send_video(msg.chat.id, InputFile::file(PathBuf::from(file)));
             request = request.supports_streaming(true);
             if let Some(metadata) = probe_telegram_video_metadata(Path::new(file)).await {
@@ -1151,6 +1315,7 @@ async fn send_download_result(
         match deliverable_files.as_slice() {
             [] => {}
             [photo] => {
+                set_download_progress(progress, StatusPhase::UploadingMedia).await;
                 bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(*photo)))
                     .await?;
             }
@@ -1163,6 +1328,7 @@ async fn send_download_result(
                         ))))
                     })
                     .collect();
+                set_download_progress(progress, StatusPhase::UploadingMedia).await;
                 bot.send_media_group(msg.chat.id, photos).await?;
             }
         }
@@ -1297,6 +1463,28 @@ fn escape_html(text: &str) -> String {
     escaped
 }
 
+fn progress_display_percent(percent: f64) -> Option<u8> {
+    if !percent.is_finite() {
+        return None;
+    }
+    Some(percent.clamp(0.0, 100.0).floor() as u8)
+}
+
+fn progress_bucket_from_display_percent(display_percent: u8) -> u8 {
+    ((display_percent.min(100) / 5) as u8).min(20)
+}
+
+fn progress_bar(bucket: u8, display_percent: u8) -> String {
+    let filled = usize::from(bucket).min(PROGRESS_BAR_WIDTH);
+    let empty = PROGRESS_BAR_WIDTH - filled;
+    let display_percent = display_percent.min(100);
+    format!(
+        "[{}{}] {display_percent:>3}%",
+        "#".repeat(filled),
+        "-".repeat(empty)
+    )
+}
+
 fn normalize_input_url(input_url: &str) -> Result<String> {
     let trimmed = input_url.trim();
     let mut url = Url::parse(trimmed).or_else(|err| {
@@ -1323,15 +1511,27 @@ async fn download_media(
     input_url: &str,
     progress: Option<&DownloadProgress<'_>>,
 ) -> Result<DownloadResponse> {
-    let normalized = normalize_input_url(input_url)?;
+    let normalized = match normalize_input_url(input_url) {
+        Ok(normalized) => normalized,
+        Err(err) => {
+            set_download_progress(progress, StatusPhase::FetchFailed).await;
+            return Err(err);
+        }
+    };
 
     let started = Instant::now();
     let item_dir = config.download_dir.join(Uuid::new_v4().to_string());
     fs::create_dir_all(&item_dir)?;
     let out_tmpl = item_dir.join("%(title).100B-%(id)s.%(ext)s");
 
-    set_download_progress(progress, "Downloading media...").await;
-    let output = run_yt_dlp_download(&normalized, &out_tmpl).await?;
+    set_download_progress_bar(progress, StatusPhase::DownloadingMedia, 0).await;
+    let output = match run_yt_dlp_download(&normalized, &out_tmpl, progress).await {
+        Ok(output) => output,
+        Err(err) => {
+            set_download_progress(progress, StatusPhase::DownloadFailed).await;
+            return Err(err);
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1351,8 +1551,10 @@ async fn download_media(
                 stderr
             );
         } else if stderr.is_empty() {
+            set_download_progress(progress, StatusPhase::DownloadFailed).await;
             return Err(anyhow!("yt-dlp failed with status: {}", output.status));
         } else {
+            set_download_progress(progress, StatusPhase::DownloadFailed).await;
             return Err(anyhow!(
                 "yt-dlp failed with status {}: {}",
                 output.status,
@@ -1363,11 +1565,26 @@ async fn download_media(
     let download_ms = started.elapsed().as_millis() as i64;
 
     let normalize_started = Instant::now();
-    download_instagram_embed_images_if_needed(&normalized, &item_dir).await?;
-    download_twitter_images_if_needed(&normalized, &item_dir).await?;
-    download_bluesky_images_if_needed(&normalized, &item_dir).await?;
+    if let Err(err) = download_instagram_embed_images_if_needed(&normalized, &item_dir).await {
+        set_download_progress(progress, StatusPhase::FetchFailed).await;
+        return Err(err);
+    }
+    if let Err(err) = download_twitter_images_if_needed(&normalized, &item_dir).await {
+        set_download_progress(progress, StatusPhase::FetchFailed).await;
+        return Err(err);
+    }
+    if let Err(err) = download_bluesky_images_if_needed(&normalized, &item_dir).await {
+        set_download_progress(progress, StatusPhase::FetchFailed).await;
+        return Err(err);
+    }
     let filename_metadata = read_delivery_filename_metadata(&item_dir);
-    let files = collect_delivery_files(&item_dir, &filename_metadata, progress).await?;
+    let files = match collect_delivery_files(&item_dir, &filename_metadata, progress).await {
+        Ok(files) => files,
+        Err(err) => {
+            set_download_progress(progress, StatusPhase::ConvertingFailed).await;
+            return Err(err);
+        }
+    };
     let convert_ms = normalize_started.elapsed().as_millis() as i64;
 
     let description = read_sidecar_text(&item_dir).unwrap_or_else(|| "(no description)".into());
@@ -2341,8 +2558,7 @@ async fn normalize_video_for_delivery(
             .arg("128k");
     }
 
-    let output = cmd
-        .arg("-c:v")
+    cmd.arg("-c:v")
         .arg("libx264")
         .arg("-preset")
         .arg("veryfast")
@@ -2352,13 +2568,27 @@ async fn normalize_video_for_delivery(
         .arg("yuv420p")
         .arg("-movflags")
         .arg("+faststart")
-        .arg(&output_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
+        .arg(&output_path);
 
-    ensure_ffmpeg_success(output, "ffmpeg")?;
+    set_download_progress_bar(progress, StatusPhase::ConvertingMedia, 0).await;
+    let output = match run_ffmpeg_with_progress(
+        &mut cmd,
+        None,
+        progress,
+        StatusPhase::ConvertingMedia,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            set_download_progress(progress, StatusPhase::ConvertingFailed).await;
+            return Err(err);
+        }
+    };
+    if let Err(err) = ensure_ffmpeg_success(output, "ffmpeg") {
+        set_download_progress(progress, StatusPhase::ConvertingFailed).await;
+        return Err(err);
+    }
 
     let size = fs::metadata(&output_path)?.len();
     if size <= TELEGRAM_UPLOAD_LIMIT_BYTES {
@@ -2371,9 +2601,7 @@ async fn normalize_video_for_delivery(
         output_path.display(),
         size
     );
-    set_download_progress(progress, "Transcoding media....").await;
-
-    match reencode_video_to_telegram_target(&output_path).await {
+    match reencode_video_to_telegram_target(&output_path, progress).await {
         Ok(targeted_path) => Ok(targeted_path),
         Err(err) => {
             warn!(
@@ -2385,17 +2613,34 @@ async fn normalize_video_for_delivery(
     }
 }
 
-async fn reencode_video_to_telegram_target(input_path: &Path) -> Result<PathBuf> {
-    let media_info = probe_video_reencode_info(input_path).await?;
-    let video_bitrate_bps = telegram_target_video_bitrate_bps(
+async fn reencode_video_to_telegram_target(
+    input_path: &Path,
+    progress: Option<&DownloadProgress<'_>>,
+) -> Result<PathBuf> {
+    let media_info = match probe_video_reencode_info(input_path).await {
+        Ok(media_info) => media_info,
+        Err(err) => {
+            set_download_progress(progress, StatusPhase::CompressingFailed).await;
+            return Err(err);
+        }
+    };
+    let video_bitrate_bps = match telegram_target_video_bitrate_bps(
         media_info.duration_seconds,
         media_info.audio.reserved_bitrate_bps,
-    )?;
+    ) {
+        Ok(video_bitrate_bps) => video_bitrate_bps,
+        Err(err) => {
+            set_download_progress(progress, StatusPhase::CompressingFailed).await;
+            return Err(err);
+        }
+    };
     let video_bitrate = format!("{}k", video_bitrate_bps / 1000);
     let output_path = input_path.with_file_name("delivery-target.mp4");
     let passlog_path = input_path.with_file_name("delivery-target-passlog");
 
-    let pass_one = TokioCommand::new("ffmpeg")
+    set_download_progress_bar(progress, StatusPhase::CompressingMediaPass1, 0).await;
+    let mut pass_one = TokioCommand::new("ffmpeg");
+    pass_one
         .arg("-y")
         .arg("-nostdin")
         .arg("-i")
@@ -2419,13 +2664,27 @@ async fn reencode_video_to_telegram_target(input_path: &Path) -> Result<PathBuf>
         .arg("-an")
         .arg("-f")
         .arg("null")
-        .arg("-")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
-    ensure_ffmpeg_success(pass_one, "ffmpeg target-size first pass")?;
+        .arg("-");
+    let pass_one = match run_ffmpeg_with_progress(
+        &mut pass_one,
+        Some(media_info.duration_seconds),
+        progress,
+        StatusPhase::CompressingMediaPass1,
+    )
+    .await
+    {
+        Ok(pass_one) => pass_one,
+        Err(err) => {
+            set_download_progress(progress, StatusPhase::CompressingFailed).await;
+            return Err(err);
+        }
+    };
+    if let Err(err) = ensure_ffmpeg_success(pass_one, "ffmpeg target-size first pass") {
+        set_download_progress(progress, StatusPhase::CompressingFailed).await;
+        return Err(err);
+    }
 
+    set_download_progress_bar(progress, StatusPhase::CompressingMediaPass2, 0).await;
     let mut pass_two = TokioCommand::new("ffmpeg");
     pass_two
         .arg("-y")
@@ -2459,17 +2718,31 @@ async fn reencode_video_to_telegram_target(input_path: &Path) -> Result<PathBuf>
             .arg("-b:a")
             .arg(format!("{}k", TELEGRAM_REENCODE_AUDIO_BITRATE_BPS / 1000));
     }
-    let pass_two = pass_two
+    pass_two
         .arg("-movflags")
         .arg("+faststart")
-        .arg(&output_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await?;
+        .arg(&output_path);
+    let pass_two = match run_ffmpeg_with_progress(
+        &mut pass_two,
+        Some(media_info.duration_seconds),
+        progress,
+        StatusPhase::CompressingMediaPass2,
+    )
+    .await
+    {
+        Ok(pass_two) => pass_two,
+        Err(err) => {
+            set_download_progress(progress, StatusPhase::CompressingFailed).await;
+            cleanup_ffmpeg_passlog(&passlog_path);
+            return Err(err);
+        }
+    };
     let result = ensure_ffmpeg_success(pass_two, "ffmpeg target-size second pass");
     cleanup_ffmpeg_passlog(&passlog_path);
-    result?;
+    if let Err(err) = result {
+        set_download_progress(progress, StatusPhase::CompressingFailed).await;
+        return Err(err);
+    }
 
     let size = fs::metadata(&output_path)?.len();
     if size > TELEGRAM_UPLOAD_LIMIT_BYTES {
@@ -2492,6 +2765,76 @@ async fn reencode_video_to_telegram_target(input_path: &Path) -> Result<PathBuf>
     }
 
     Ok(output_path)
+}
+
+async fn run_ffmpeg_with_progress(
+    cmd: &mut TokioCommand,
+    duration_seconds: Option<f64>,
+    progress: Option<&DownloadProgress<'_>>,
+    phase: StatusPhase,
+) -> Result<std::process::Output> {
+    let mut child = cmd
+        .arg("-progress")
+        .arg("pipe:2")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture ffmpeg stderr"))?;
+    let mut lines = BufReader::new(stderr).lines();
+    let mut stderr_text = String::new();
+    let mut throttle = ProgressThrottle::after_sent(phase, 0);
+    let mut duration_seconds = duration_seconds;
+
+    while let Some(line) = lines.next_line().await? {
+        if duration_seconds.is_none() {
+            duration_seconds = parse_ffmpeg_duration_seconds(&line);
+        }
+        if let Some(percent) = duration_seconds
+            .and_then(|duration_seconds| parse_ffmpeg_progress_percent(&line, duration_seconds))
+        {
+            throttle.update(progress, percent).await;
+        } else {
+            stderr_text.push_str(&line);
+            stderr_text.push('\n');
+        }
+    }
+
+    throttle.flush(progress).await;
+    let status = child.wait().await?;
+    Ok(output_from_status(
+        status,
+        Vec::new(),
+        stderr_text.into_bytes(),
+    ))
+}
+
+fn parse_ffmpeg_progress_percent(line: &str, duration_seconds: f64) -> Option<f64> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        return None;
+    }
+    let raw = line.strip_prefix("out_time_ms=")?;
+    let out_time_us = raw.trim().parse::<u64>().ok()?;
+    Some((out_time_us as f64 / 1_000_000.0) * 100.0 / duration_seconds)
+}
+
+fn parse_ffmpeg_duration_seconds(line: &str) -> Option<f64> {
+    let duration = line.split_once("Duration:")?.1.trim();
+    let timestamp = duration.split_once(',')?.0.trim();
+    parse_ffmpeg_timestamp_seconds(timestamp)
+}
+
+fn parse_ffmpeg_timestamp_seconds(timestamp: &str) -> Option<f64> {
+    let mut parts = timestamp.split(':');
+    let hours = parts.next()?.parse::<f64>().ok()?;
+    let minutes = parts.next()?.parse::<f64>().ok()?;
+    let seconds = parts.next()?.parse::<f64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
 }
 
 fn ensure_ffmpeg_success(output: std::process::Output, context: &str) -> Result<()> {
@@ -2974,12 +3317,14 @@ fn format_compact_date(input: &str) -> Option<String> {
 async fn run_yt_dlp_download(
     normalized: &str,
     out_tmpl: &Utf8PathBuf,
+    progress: Option<&DownloadProgress<'_>>,
 ) -> Result<std::process::Output> {
     let preferred = spawn_yt_dlp_download(
         normalized,
         out_tmpl,
         Some("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"),
         yt_dlp_format_sort(normalized),
+        progress,
     )
     .await?;
     if preferred.status.success() {
@@ -2988,7 +3333,7 @@ async fn run_yt_dlp_download(
 
     let stderr = String::from_utf8_lossy(&preferred.stderr);
     if should_retry_without_video_format(&stderr) {
-        let fallback = spawn_yt_dlp_download(normalized, out_tmpl, None, None).await?;
+        let fallback = spawn_yt_dlp_download(normalized, out_tmpl, None, None, progress).await?;
         return Ok(fallback);
     }
 
@@ -3023,6 +3368,7 @@ async fn spawn_yt_dlp_download(
     out_tmpl: &Utf8PathBuf,
     format_selector: Option<&str>,
     format_sort: Option<&str>,
+    progress: Option<&DownloadProgress<'_>>,
 ) -> Result<std::process::Output> {
     let mut cmd = TokioCommand::new("yt-dlp");
     if let Some(format_selector) = format_selector {
@@ -3035,7 +3381,11 @@ async fn spawn_yt_dlp_download(
         cmd.arg("-S").arg(format_sort);
     }
 
-    let output = cmd
+    let mut child = cmd
+        .arg("--newline")
+        .arg("--progress")
+        .arg("--progress-delta")
+        .arg("1")
         .arg("--write-info-json")
         .arg("--write-description")
         .arg("--convert-thumbnails")
@@ -3043,12 +3393,100 @@ async fn spawn_yt_dlp_download(
         .arg("--output")
         .arg(out_tmpl.as_str())
         .arg(normalized)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .await?;
+        .spawn()?;
 
-    Ok(output)
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture yt-dlp stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture yt-dlp stderr"))?;
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stderr_text = String::new();
+    let mut progress_throttle = ProgressThrottle::after_sent(StatusPhase::DownloadingMedia, 0);
+
+    while stdout_open || stderr_open {
+        tokio::select! {
+            line = stdout_lines.next_line(), if stdout_open => {
+                match line? {
+                    Some(line) => handle_yt_dlp_progress_line(&line, progress, &mut progress_throttle).await,
+                    None => stdout_open = false,
+                }
+            }
+            line = stderr_lines.next_line(), if stderr_open => {
+                match line? {
+                    Some(line) => {
+                        handle_yt_dlp_progress_line(&line, progress, &mut progress_throttle).await;
+                        if !is_yt_dlp_progress_line(&line) {
+                            stderr_text.push_str(&line);
+                            stderr_text.push('\n');
+                        }
+                    }
+                    None => stderr_open = false,
+                }
+            }
+        }
+    }
+
+    progress_throttle.flush(progress).await;
+    let status = child.wait().await?;
+    Ok(output_from_status(
+        status,
+        Vec::new(),
+        stderr_text.into_bytes(),
+    ))
+}
+
+async fn handle_yt_dlp_progress_line(
+    line: &str,
+    progress: Option<&DownloadProgress<'_>>,
+    throttle: &mut ProgressThrottle,
+) {
+    if let Some(percent) = parse_yt_dlp_progress_percent(line) {
+        throttle.update(progress, percent).await;
+    }
+}
+
+fn is_yt_dlp_progress_line(line: &str) -> bool {
+    parse_yt_dlp_progress_percent(line).is_some()
+}
+
+fn parse_yt_dlp_progress_percent(line: &str) -> Option<f64> {
+    let trimmed = line.trim();
+    let raw = trimmed.strip_prefix("download:").unwrap_or(trimmed).trim();
+    parse_percent_from_text(raw)
+}
+
+fn parse_percent_from_text(text: &str) -> Option<f64> {
+    let percent_index = text.find('%')?;
+    let before_percent = &text[..percent_index];
+    let start = before_percent
+        .rfind(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .map_or(0, |index| index + 1);
+    let raw = before_percent[start..].trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse::<f64>().ok()
+}
+
+fn output_from_status(
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> std::process::Output {
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 fn should_retry_without_video_format(stderr: &str) -> bool {
@@ -3608,6 +4046,69 @@ mod tests {
             "https://example.com/profile/notpeter.bsky.social/post/3mjcw2b6ajk25",
             "ERROR: [Bluesky] 3mjcw2b6ajk25: No video could be found in this post"
         ));
+    }
+
+    #[test]
+    fn status_phase_labels_are_distinct() {
+        let phases = [
+            StatusPhase::FetchingLink,
+            StatusPhase::FetchFailed,
+            StatusPhase::DownloadingMedia,
+            StatusPhase::DownloadFailed,
+            StatusPhase::ConvertingMedia,
+            StatusPhase::ConvertingFailed,
+            StatusPhase::CompressingMediaPass1,
+            StatusPhase::CompressingMediaPass2,
+            StatusPhase::CompressingFailed,
+            StatusPhase::UploadingMedia,
+            StatusPhase::UploadFailed,
+            StatusPhase::DownloadComplete,
+        ];
+        let labels = phases.map(StatusPhase::label);
+        let unique = labels
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), labels.len());
+    }
+
+    #[test]
+    fn formats_progress_bar_in_five_percent_steps_with_one_percent_text() {
+        assert_eq!(progress_display_percent(52.9), Some(52));
+        assert_eq!(progress_bucket_from_display_percent(52), 10);
+        assert_eq!(progress_bar(10, 52), "[##########----------]  52%");
+    }
+
+    #[test]
+    fn parses_yt_dlp_progress_template_lines() {
+        assert_eq!(parse_yt_dlp_progress_percent("download: 42.7%"), Some(42.7));
+        assert_eq!(parse_yt_dlp_progress_percent(" 42.7%"), Some(42.7));
+        assert_eq!(
+            parse_yt_dlp_progress_percent("[download]  42.7% of 10.00MiB"),
+            Some(42.7)
+        );
+        assert_eq!(
+            parse_yt_dlp_progress_percent("[download] Destination: file.mp4"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_ffmpeg_progress_timestamps() {
+        assert_eq!(
+            parse_ffmpeg_progress_percent("out_time_ms=5000000", 20.0),
+            Some(25.0)
+        );
+    }
+
+    #[test]
+    fn parses_ffmpeg_duration_lines() {
+        assert_eq!(
+            parse_ffmpeg_duration_seconds(
+                "  Duration: 00:00:24.90, start: 0.000000, bitrate: 1240 kb/s"
+            ),
+            Some(24.9)
+        );
     }
 
     #[test]
