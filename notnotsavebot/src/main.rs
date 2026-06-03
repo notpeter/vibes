@@ -15,6 +15,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use teloxide::{
+    ApiError, RequestError,
     prelude::*,
     types::{
         BotCommand, BotCommandScope, InputFile, InputMedia, InputMediaPhoto, LinkPreviewOptions,
@@ -252,6 +253,8 @@ fn default_download_dir() -> Utf8PathBuf {
 }
 
 const MAX_DELIVERY_FILENAME_LEN: usize = 79;
+const TELEGRAM_UPLOAD_LIMIT_BYTES: u64 = 50_000_000;
+const TELEGRAM_UPLOAD_LIMIT_LABEL: &str = "50 MB";
 
 #[derive(Debug, Clone)]
 enum AuthorizationTarget {
@@ -979,7 +982,21 @@ async fn handle_download_request(
 ) -> ResponseResult<()> {
     let download = download_media(config, input).await;
     match download {
-        Ok(media) => send_download_result(bot, msg, media).await?,
+        Ok(media) => {
+            if let Err(e) = send_download_result(bot, msg, media).await {
+                error!(
+                    "download delivery failed for chat {} input {:?}: {e:#}",
+                    msg.chat.id.0, input
+                );
+                if let Err(notify_error) = send_delivery_error_notice(bot, msg, &e).await {
+                    error!(
+                        "failed to notify chat {} after delivery error: {notify_error:#}",
+                        msg.chat.id.0
+                    );
+                    return Err(notify_error);
+                }
+            }
+        }
         Err(e) => {
             error!(
                 "download request failed for chat {} input {:?}: {e:#}",
@@ -1019,6 +1036,15 @@ async fn send_download_result(
     .await?;
     if media.files.len() == 1 {
         let file = &media.files[0];
+        if let Some(size) = oversized_telegram_file_size(file)? {
+            warn!(
+                "skipping Telegram upload larger than {} chat_id={} file={} size_bytes={}",
+                TELEGRAM_UPLOAD_LIMIT_LABEL, msg.chat.id.0, file, size
+            );
+            send_file_too_large_notice(bot, msg, size).await?;
+            return Ok(());
+        }
+
         if is_image_path(file) {
             bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(file)))
                 .await?;
@@ -1038,17 +1064,111 @@ async fn send_download_result(
             );
         }
     } else {
-        let photos: Vec<InputMedia> = media
-            .files
-            .iter()
-            .map(|f| InputMedia::Photo(InputMediaPhoto::new(InputFile::file(PathBuf::from(f)))))
-            .collect();
-        if !photos.is_empty() {
-            bot.send_media_group(msg.chat.id, photos).await?;
+        let mut deliverable_files = Vec::new();
+        let mut skipped_files = 0;
+        let mut largest_skipped_size = 0;
+        for file in &media.files {
+            if let Some(size) = oversized_telegram_file_size(file)? {
+                skipped_files += 1;
+                largest_skipped_size = largest_skipped_size.max(size);
+                warn!(
+                    "skipping Telegram upload larger than {} chat_id={} file={} size_bytes={}",
+                    TELEGRAM_UPLOAD_LIMIT_LABEL, msg.chat.id.0, file, size
+                );
+                continue;
+            }
+
+            deliverable_files.push(file.as_str());
+        }
+
+        match deliverable_files.as_slice() {
+            [] => {}
+            [photo] => {
+                bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(*photo)))
+                    .await?;
+            }
+            photos => {
+                let photos: Vec<InputMedia> = photos
+                    .iter()
+                    .map(|file| {
+                        InputMedia::Photo(InputMediaPhoto::new(InputFile::file(PathBuf::from(
+                            *file,
+                        ))))
+                    })
+                    .collect();
+                bot.send_media_group(msg.chat.id, photos).await?;
+            }
+        }
+        if skipped_files > 0 {
+            send_files_too_large_notice(bot, msg, skipped_files, largest_skipped_size).await?;
         }
     }
 
     Ok(())
+}
+
+async fn send_delivery_error_notice(
+    bot: &Bot,
+    msg: &Message,
+    error: &RequestError,
+) -> ResponseResult<()> {
+    let text = if is_request_entity_too_large(error) {
+        format!(
+            "Something went wrong while sending the file: Telegram rejected it as larger than the {TELEGRAM_UPLOAD_LIMIT_LABEL} bot upload limit."
+        )
+    } else {
+        "Something went wrong while sending the downloaded media. Please try again later."
+            .to_string()
+    };
+    bot.send_message(msg.chat.id, text).await?;
+    Ok(())
+}
+
+fn is_request_entity_too_large(error: &RequestError) -> bool {
+    matches!(error, RequestError::Api(api) if *api == ApiError::RequestEntityTooLarge)
+}
+
+fn oversized_telegram_file_size(path: &str) -> std::io::Result<Option<u64>> {
+    let size = fs::metadata(path)?.len();
+    Ok((size > TELEGRAM_UPLOAD_LIMIT_BYTES).then_some(size))
+}
+
+async fn send_file_too_large_notice(bot: &Bot, msg: &Message, size: u64) -> ResponseResult<()> {
+    bot.send_message(
+        msg.chat.id,
+        format!(
+            "The downloaded file is {}, which is over Telegram's {TELEGRAM_UPLOAD_LIMIT_LABEL} bot upload limit, so I did not send it.",
+            format_file_size(size)
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn send_files_too_large_notice(
+    bot: &Bot,
+    msg: &Message,
+    skipped_files: usize,
+    largest_size: u64,
+) -> ResponseResult<()> {
+    let noun = if skipped_files == 1 {
+        "file was"
+    } else {
+        "files were"
+    };
+    bot.send_message(
+        msg.chat.id,
+        format!(
+            "{skipped_files} downloaded {noun} over Telegram's {TELEGRAM_UPLOAD_LIMIT_LABEL} bot upload limit and were not sent. The largest was {}.",
+            format_file_size(largest_size)
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+fn format_file_size(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_000_000.0)
 }
 
 fn preview_log_text(input: &str) -> String {
