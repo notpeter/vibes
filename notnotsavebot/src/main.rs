@@ -2653,6 +2653,7 @@ async fn run_yt_dlp_download(
         normalized,
         out_tmpl,
         Some("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"),
+        yt_dlp_format_sort(normalized),
     )
     .await?;
     if preferred.status.success() {
@@ -2661,17 +2662,41 @@ async fn run_yt_dlp_download(
 
     let stderr = String::from_utf8_lossy(&preferred.stderr);
     if should_retry_without_video_format(&stderr) {
-        let fallback = spawn_yt_dlp_download(normalized, out_tmpl, None).await?;
+        let fallback = spawn_yt_dlp_download(normalized, out_tmpl, None, None).await?;
         return Ok(fallback);
     }
 
     Ok(preferred)
 }
 
+fn yt_dlp_format_sort(normalized: &str) -> Option<&'static str> {
+    let host = Url::parse(normalized)
+        .ok()?
+        .host_str()?
+        .to_ascii_lowercase();
+    if is_instagram_host(&host) || is_youtube_host(&host) {
+        return Some("res,vcodec:h265:h264");
+    }
+
+    None
+}
+
+fn is_instagram_host(host: &str) -> bool {
+    host == "instagram.com" || host == "www.instagram.com"
+}
+
+fn is_youtube_host(host: &str) -> bool {
+    matches!(
+        host,
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "youtu.be"
+    )
+}
+
 async fn spawn_yt_dlp_download(
     normalized: &str,
     out_tmpl: &Utf8PathBuf,
     format_selector: Option<&str>,
+    format_sort: Option<&str>,
 ) -> Result<std::process::Output> {
     let mut cmd = TokioCommand::new("yt-dlp");
     if let Some(format_selector) = format_selector {
@@ -2679,6 +2704,9 @@ async fn spawn_yt_dlp_download(
             .arg(format_selector)
             .arg("--merge-output-format")
             .arg("mp4");
+    }
+    if let Some(format_sort) = format_sort {
+        cmd.arg("-S").arg(format_sort);
     }
 
     let output = cmd
