@@ -18,8 +18,8 @@ use teloxide::{
     ApiError, RequestError,
     prelude::*,
     types::{
-        BotCommand, BotCommandScope, InputFile, InputMedia, InputMediaPhoto, LinkPreviewOptions,
-        ParseMode,
+        BotCommand, BotCommandScope, ChatId, InputFile, InputMedia, InputMediaPhoto,
+        LinkPreviewOptions, MessageId, ParseMode,
     },
     utils::command::BotCommands,
 };
@@ -153,6 +153,62 @@ impl UserRole {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetAudioPlan {
+    copy: bool,
+    reserved_bitrate_bps: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VideoReencodeInfo {
+    duration_seconds: f64,
+    audio: TargetAudioPlan,
+}
+
+struct DownloadProgress<'a> {
+    bot: &'a Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+}
+
+impl<'a> DownloadProgress<'a> {
+    fn new(bot: &'a Bot, message: &Message) -> Self {
+        Self {
+            bot,
+            chat_id: message.chat.id,
+            message_id: message.id,
+        }
+    }
+
+    async fn set(&self, text: &str) {
+        if let Err(err) = self
+            .bot
+            .edit_message_text(self.chat_id, self.message_id, text)
+            .await
+        {
+            warn!(
+                "failed to update Telegram status message chat_id={} message_id={}: {}",
+                self.chat_id.0, self.message_id.0, err
+            );
+        }
+    }
+
+    async fn delete(&self) {
+        if let Err(err) = self.bot.delete_message(self.chat_id, self.message_id).await {
+            warn!(
+                "failed to delete Telegram status message chat_id={} message_id={}: {}",
+                self.chat_id.0, self.message_id.0, err
+            );
+        }
+    }
+}
+
+async fn set_download_progress(progress: Option<&DownloadProgress<'_>>, text: &str) {
+    if let Some(progress) = progress {
+        progress.set(text).await;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct DownloadResponse {
     media_id: i64,
@@ -254,6 +310,11 @@ fn default_download_dir() -> Utf8PathBuf {
 
 const MAX_DELIVERY_FILENAME_LEN: usize = 79;
 const TELEGRAM_UPLOAD_LIMIT_BYTES: u64 = 50_000_000;
+const TELEGRAM_REENCODE_TARGET_BYTES: u64 = 48_000_000;
+const TELEGRAM_REENCODE_AUDIO_BITRATE_BPS: u64 = 128_000;
+const TELEGRAM_COPY_AUDIO_MAX_BITRATE_BPS: u64 = 131_000;
+const TELEGRAM_REENCODE_CONTAINER_OVERHEAD_BPS: u64 = 64_000;
+const TELEGRAM_REENCODE_MIN_VIDEO_BITRATE_BPS: u64 = 150_000;
 const TELEGRAM_UPLOAD_LIMIT_LABEL: &str = "50 MB";
 
 #[derive(Debug, Clone)]
@@ -980,9 +1041,13 @@ async fn handle_download_request(
     config: &Config,
     input: &str,
 ) -> ResponseResult<()> {
-    let download = download_media(config, input).await;
+    let status = bot.send_message(msg.chat.id, "Fetching link...").await?;
+    let progress = DownloadProgress::new(bot, &status);
+
+    let download = download_media(config, input, Some(&progress)).await;
     match download {
         Ok(media) => {
+            progress.set("Download complete.").await;
             if let Err(e) = send_download_result(bot, msg, media).await {
                 error!(
                     "download delivery failed for chat {} input {:?}: {e:#}",
@@ -996,12 +1061,14 @@ async fn handle_download_request(
                     return Err(notify_error);
                 }
             }
+            progress.delete().await;
         }
         Err(e) => {
             error!(
                 "download request failed for chat {} input {:?}: {e:#}",
                 msg.chat.id.0, input
             );
+            progress.set("Download failed.").await;
             bot.send_message(msg.chat.id, format!("Download failed: {e:#}"))
                 .await?;
         }
@@ -1231,7 +1298,13 @@ fn escape_html(text: &str) -> String {
 }
 
 fn normalize_input_url(input_url: &str) -> Result<String> {
-    let mut url = Url::parse(input_url.trim())?;
+    let trimmed = input_url.trim();
+    let mut url = Url::parse(trimmed).or_else(|err| {
+        if trimmed.contains("://") {
+            return Err(err);
+        }
+        Url::parse(&format!("https://{trimmed}"))
+    })?;
     if let Some(host) = url.host_str() {
         let host = host.to_ascii_lowercase();
         if host == "x.com"
@@ -1245,7 +1318,11 @@ fn normalize_input_url(input_url: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResponse> {
+async fn download_media(
+    config: &Config,
+    input_url: &str,
+    progress: Option<&DownloadProgress<'_>>,
+) -> Result<DownloadResponse> {
     let normalized = normalize_input_url(input_url)?;
 
     let started = Instant::now();
@@ -1253,6 +1330,7 @@ async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResp
     fs::create_dir_all(&item_dir)?;
     let out_tmpl = item_dir.join("%(title).100B-%(id)s.%(ext)s");
 
+    set_download_progress(progress, "Downloading media...").await;
     let output = run_yt_dlp_download(&normalized, &out_tmpl).await?;
 
     if !output.status.success() {
@@ -1289,7 +1367,7 @@ async fn download_media(config: &Config, input_url: &str) -> Result<DownloadResp
     download_twitter_images_if_needed(&normalized, &item_dir).await?;
     download_bluesky_images_if_needed(&normalized, &item_dir).await?;
     let filename_metadata = read_delivery_filename_metadata(&item_dir);
-    let files = collect_delivery_files(&item_dir, &filename_metadata).await?;
+    let files = collect_delivery_files(&item_dir, &filename_metadata, progress).await?;
     let convert_ms = normalize_started.elapsed().as_millis() as i64;
 
     let description = read_sidecar_text(&item_dir).unwrap_or_else(|| "(no description)".into());
@@ -2192,6 +2270,7 @@ fn image_extension_from_url(image_url: &str) -> &'static str {
 async fn collect_delivery_files(
     item_dir: &Utf8PathBuf,
     filename_metadata: &DeliveryFilenameMetadata,
+    progress: Option<&DownloadProgress<'_>>,
 ) -> Result<Vec<String>> {
     let mut video_files = Vec::new();
     let mut audio_files = Vec::new();
@@ -2212,7 +2291,8 @@ async fn collect_delivery_files(
     image_files.sort();
 
     if let Some(video_path) = video_files.first() {
-        let normalized = normalize_video_for_delivery(video_path, audio_files.first()).await?;
+        let normalized =
+            normalize_video_for_delivery(video_path, audio_files.first(), progress).await?;
         let renamed = rename_delivery_file(&normalized, filename_metadata, None)?;
         return Ok(vec![renamed.to_string_lossy().to_string()]);
     }
@@ -2233,6 +2313,7 @@ async fn collect_delivery_files(
 async fn normalize_video_for_delivery(
     video_path: &PathBuf,
     audio_path: Option<&PathBuf>,
+    progress: Option<&DownloadProgress<'_>>,
 ) -> Result<PathBuf> {
     let output_path = video_path.with_file_name("delivery.mp4");
     let mut cmd = TokioCommand::new("ffmpeg");
@@ -2277,15 +2358,260 @@ async fn normalize_video_for_delivery(
         .output()
         .await?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if stderr.is_empty() {
-            bail!("ffmpeg failed with status {}", output.status);
+    ensure_ffmpeg_success(output, "ffmpeg")?;
+
+    let size = fs::metadata(&output_path)?.len();
+    if size <= TELEGRAM_UPLOAD_LIMIT_BYTES {
+        return Ok(output_path);
+    }
+
+    warn!(
+        "normalized video is larger than {}; trying target-size re-encode file={} size_bytes={}",
+        TELEGRAM_UPLOAD_LIMIT_LABEL,
+        output_path.display(),
+        size
+    );
+    set_download_progress(progress, "Transcoding media....").await;
+
+    match reencode_video_to_telegram_target(&output_path).await {
+        Ok(targeted_path) => Ok(targeted_path),
+        Err(err) => {
+            warn!(
+                "target-size video re-encode failed for {}: {err:#}",
+                output_path.display()
+            );
+            Ok(output_path)
         }
-        bail!("ffmpeg failed with status {}: {}", output.status, stderr);
+    }
+}
+
+async fn reencode_video_to_telegram_target(input_path: &Path) -> Result<PathBuf> {
+    let media_info = probe_video_reencode_info(input_path).await?;
+    let video_bitrate_bps = telegram_target_video_bitrate_bps(
+        media_info.duration_seconds,
+        media_info.audio.reserved_bitrate_bps,
+    )?;
+    let video_bitrate = format!("{}k", video_bitrate_bps / 1000);
+    let output_path = input_path.with_file_name("delivery-target.mp4");
+    let passlog_path = input_path.with_file_name("delivery-target-passlog");
+
+    let pass_one = TokioCommand::new("ffmpeg")
+        .arg("-y")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(input_path)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("veryfast")
+        .arg("-b:v")
+        .arg(&video_bitrate)
+        .arg("-vf")
+        .arg("scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-pass")
+        .arg("1")
+        .arg("-passlogfile")
+        .arg(&passlog_path)
+        .arg("-an")
+        .arg("-f")
+        .arg("null")
+        .arg("-")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    ensure_ffmpeg_success(pass_one, "ffmpeg target-size first pass")?;
+
+    let mut pass_two = TokioCommand::new("ffmpeg");
+    pass_two
+        .arg("-y")
+        .arg("-nostdin")
+        .arg("-i")
+        .arg(input_path)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("0:a:0?")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("veryfast")
+        .arg("-b:v")
+        .arg(&video_bitrate)
+        .arg("-vf")
+        .arg("scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-pass")
+        .arg("2")
+        .arg("-passlogfile")
+        .arg(&passlog_path);
+    if media_info.audio.copy {
+        pass_two.arg("-c:a").arg("copy");
+    } else {
+        pass_two
+            .arg("-c:a")
+            .arg("aac")
+            .arg("-b:a")
+            .arg(format!("{}k", TELEGRAM_REENCODE_AUDIO_BITRATE_BPS / 1000));
+    }
+    let pass_two = pass_two
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(&output_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    let result = ensure_ffmpeg_success(pass_two, "ffmpeg target-size second pass");
+    cleanup_ffmpeg_passlog(&passlog_path);
+    result?;
+
+    let size = fs::metadata(&output_path)?.len();
+    if size > TELEGRAM_UPLOAD_LIMIT_BYTES {
+        warn!(
+            "target-size video re-encode is still larger than {} file={} size_bytes={} target_bytes={}",
+            TELEGRAM_UPLOAD_LIMIT_LABEL,
+            output_path.display(),
+            size,
+            TELEGRAM_REENCODE_TARGET_BYTES
+        );
+    } else {
+        info!(
+            "target-size video re-encode completed file={} size_bytes={} video_bitrate_bps={} audio_bitrate_bps={} audio_copy={}",
+            output_path.display(),
+            size,
+            video_bitrate_bps,
+            media_info.audio.reserved_bitrate_bps,
+            media_info.audio.copy
+        );
     }
 
     Ok(output_path)
+}
+
+fn ensure_ffmpeg_success(output: std::process::Output, context: &str) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        bail!("{context} failed with status {}", output.status);
+    }
+    bail!("{context} failed with status {}: {}", output.status, stderr);
+}
+
+fn telegram_target_video_bitrate_bps(duration_seconds: f64, audio_bitrate_bps: u64) -> Result<u64> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        bail!("video duration is not usable for target-size re-encode: {duration_seconds}");
+    }
+
+    let total_bitrate_bps = (TELEGRAM_REENCODE_TARGET_BYTES as f64 * 8.0 / duration_seconds) as u64;
+    let reserved_bps = audio_bitrate_bps
+        + TELEGRAM_REENCODE_CONTAINER_OVERHEAD_BPS
+        + TELEGRAM_REENCODE_MIN_VIDEO_BITRATE_BPS;
+    if total_bitrate_bps <= reserved_bps {
+        bail!(
+            "video is too long to fit under {} with a usable bitrate: duration_seconds={duration_seconds:.1}",
+            TELEGRAM_UPLOAD_LIMIT_LABEL
+        );
+    }
+
+    Ok(total_bitrate_bps - audio_bitrate_bps - TELEGRAM_REENCODE_CONTAINER_OVERHEAD_BPS)
+}
+
+async fn probe_video_reencode_info(path: &Path) -> Result<VideoReencodeInfo> {
+    let ffprobe = which("ffprobe").context("required tool `ffprobe` was not found on PATH")?;
+    let output = TokioCommand::new(ffprobe)
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("stream=codec_type,codec_name,bit_rate:format=duration")
+        .arg("-of")
+        .arg("json")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!("ffprobe failed with status {}", output.status);
+        }
+        bail!("ffprobe failed with status {}: {}", output.status, stderr);
+    }
+
+    let payload: Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse ffprobe JSON")?;
+    let duration_seconds = payload
+        .get("format")
+        .and_then(|format| format.get("duration"))
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "ffprobe did not return video duration for {}",
+                path.display()
+            )
+        })?;
+
+    Ok(VideoReencodeInfo {
+        duration_seconds,
+        audio: target_audio_plan(&payload),
+    })
+}
+
+fn target_audio_plan(payload: &Value) -> TargetAudioPlan {
+    let audio = payload
+        .get("streams")
+        .and_then(Value::as_array)
+        .and_then(|streams| {
+            streams.iter().find(|stream| {
+                stream
+                    .get("codec_type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|codec_type| codec_type == "audio")
+            })
+        });
+
+    let codec_name = audio
+        .and_then(|stream| stream.get("codec_name"))
+        .and_then(Value::as_str);
+    let source_bitrate = audio.and_then(read_stream_bitrate_bps);
+    if codec_name.is_some_and(|codec| codec == "aac")
+        && source_bitrate.is_some_and(|bitrate| bitrate <= TELEGRAM_COPY_AUDIO_MAX_BITRATE_BPS)
+    {
+        return TargetAudioPlan {
+            copy: true,
+            reserved_bitrate_bps: source_bitrate.unwrap(),
+        };
+    }
+
+    TargetAudioPlan {
+        copy: false,
+        reserved_bitrate_bps: TELEGRAM_REENCODE_AUDIO_BITRATE_BPS,
+    }
+}
+
+fn read_stream_bitrate_bps(stream: &Value) -> Option<u64> {
+    stream
+        .get("bit_rate")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn cleanup_ffmpeg_passlog(passlog_path: &Path) {
+    for suffix in ["-0.log", "-0.log.mbtree", ".log", ".log.mbtree"] {
+        let path = PathBuf::from(format!("{}{}", passlog_path.display(), suffix));
+        let _ = fs::remove_file(path);
+    }
 }
 
 async fn probe_telegram_video_metadata(path: &Path) -> Option<TelegramVideoMetadata> {
@@ -3285,6 +3611,22 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_schemeless_urls_as_https() {
+        assert_eq!(
+            normalize_input_url("facebook.com/reel/1838643350132773").unwrap(),
+            "https://facebook.com/reel/1838643350132773"
+        );
+    }
+
+    #[test]
+    fn normalizes_schemeless_twitter_urls_and_strips_query() {
+        assert_eq!(
+            normalize_input_url("x.com/notpeter/status/123?ref=ignored").unwrap(),
+            "https://x.com/notpeter/status/123"
+        );
+    }
+
+    #[test]
     fn extracts_instagram_metadata_from_graphql_media() {
         let media = serde_json::json!({
             "owner": {
@@ -3401,6 +3743,68 @@ mod tests {
                 timestamp: Some(1726871662),
                 text: "They literally made signs.".into(),
             })
+        );
+    }
+
+    #[test]
+    fn copies_aac_audio_at_or_below_threshold_for_target_encode() {
+        let payload = serde_json::json!({
+            "streams": [{
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "bit_rate": "131000"
+            }]
+        });
+
+        assert_eq!(
+            target_audio_plan(&payload),
+            TargetAudioPlan {
+                copy: true,
+                reserved_bitrate_bps: 131_000,
+            }
+        );
+    }
+
+    #[test]
+    fn transcodes_audio_above_threshold_for_target_encode() {
+        let payload = serde_json::json!({
+            "streams": [{
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "bit_rate": "131001"
+            }]
+        });
+
+        assert_eq!(
+            target_audio_plan(&payload),
+            TargetAudioPlan {
+                copy: false,
+                reserved_bitrate_bps: TELEGRAM_REENCODE_AUDIO_BITRATE_BPS,
+            }
+        );
+    }
+
+    #[test]
+    fn target_size_bitrate_budget_leaves_upload_headroom() {
+        let duration_seconds = 156.0;
+        let video_bitrate = telegram_target_video_bitrate_bps(
+            duration_seconds,
+            TELEGRAM_REENCODE_AUDIO_BITRATE_BPS,
+        )
+        .unwrap();
+        let total_bitrate = video_bitrate
+            + TELEGRAM_REENCODE_AUDIO_BITRATE_BPS
+            + TELEGRAM_REENCODE_CONTAINER_OVERHEAD_BPS;
+        let estimated_bytes = (total_bitrate as f64 * duration_seconds / 8.0) as u64;
+
+        assert!(estimated_bytes <= TELEGRAM_REENCODE_TARGET_BYTES);
+        assert!(estimated_bytes < TELEGRAM_UPLOAD_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn target_size_bitrate_budget_rejects_too_long_videos() {
+        assert!(
+            telegram_target_video_bitrate_bps(1800.0, TELEGRAM_REENCODE_AUDIO_BITRATE_BPS).is_err()
         );
     }
 
