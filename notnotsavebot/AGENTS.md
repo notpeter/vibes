@@ -32,6 +32,6 @@
 
 ```bash
 cargo run -- config init
-cargo run -- run
+cargo run
 cargo check
 ```

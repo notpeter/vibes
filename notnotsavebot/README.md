@@ -24,7 +24,7 @@ Rust Telegram bot for fetching social post media using `yt-dlp`.
 ```bash
 cargo run -- config init
 # edit config.conl
-cargo run -- run
+cargo run
 ```
 
 Default config path is `config.conl`. Override it with `-c/--config`.

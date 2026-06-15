@@ -40,7 +40,7 @@ struct Cli {
     config: Utf8PathBuf,
 
     #[command(subcommand)]
-    command: CliCommand,
+    command: Option<CliCommand>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -483,7 +483,7 @@ enum AuthorizationTarget {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    match cli.command.unwrap_or(CliCommand::Run) {
         CliCommand::Run => {
             let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
