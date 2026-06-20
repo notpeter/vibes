@@ -1263,78 +1263,97 @@ async fn send_download_result(
         show_above_text: false,
     })
     .await?;
-    if media.files.len() == 1 {
-        let file = &media.files[0];
+    let mut deliverable_files = Vec::new();
+    let mut skipped_files = 0;
+    let mut largest_skipped_size = 0;
+    for file in &media.files {
         if let Some(size) = oversized_telegram_file_size(file)? {
+            skipped_files += 1;
+            largest_skipped_size = largest_skipped_size.max(size);
             warn!(
                 "skipping Telegram upload larger than {} chat_id={} file={} size_bytes={}",
                 TELEGRAM_UPLOAD_LIMIT_LABEL, msg.chat.id.0, file, size
             );
-            send_file_too_large_notice(bot, msg, size).await?;
-            return Ok(());
+            continue;
         }
 
-        if is_image_path(file) {
-            set_download_progress(progress, StatusPhase::UploadingMedia).await;
-            bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(file)))
-                .await?;
-        } else {
-            set_download_progress(progress, StatusPhase::UploadingMedia).await;
-            let mut request = bot.send_video(msg.chat.id, InputFile::file(PathBuf::from(file)));
-            request = request.supports_streaming(true);
-            if let Some(metadata) = probe_telegram_video_metadata(Path::new(file)).await {
-                request = request
-                    .width(metadata.width)
-                    .height(metadata.height)
-                    .duration(metadata.duration_seconds);
-            }
-            request.await?;
-            info!(
-                "telegram processed video sent chat_id={} message_id={} file={}",
-                msg.chat.id.0, msg.id.0, file
-            );
-        }
+        deliverable_files.push(file.as_str());
+    }
+
+    if deliverable_files.iter().all(|file| is_image_path(file)) {
+        send_delivery_photos(bot, msg, &deliverable_files, progress).await?;
     } else {
-        let mut deliverable_files = Vec::new();
-        let mut skipped_files = 0;
-        let mut largest_skipped_size = 0;
-        for file in &media.files {
-            if let Some(size) = oversized_telegram_file_size(file)? {
-                skipped_files += 1;
-                largest_skipped_size = largest_skipped_size.max(size);
-                warn!(
-                    "skipping Telegram upload larger than {} chat_id={} file={} size_bytes={}",
-                    TELEGRAM_UPLOAD_LIMIT_LABEL, msg.chat.id.0, file, size
-                );
-                continue;
-            }
-
-            deliverable_files.push(file.as_str());
+        for file in &deliverable_files {
+            send_delivery_file(bot, msg, file, progress).await?;
         }
+    }
 
-        match deliverable_files.as_slice() {
-            [] => {}
-            [photo] => {
-                set_download_progress(progress, StatusPhase::UploadingMedia).await;
-                bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(*photo)))
-                    .await?;
-            }
-            photos => {
-                let photos: Vec<InputMedia> = photos
-                    .iter()
-                    .map(|file| {
-                        InputMedia::Photo(InputMediaPhoto::new(InputFile::file(PathBuf::from(
-                            *file,
-                        ))))
-                    })
-                    .collect();
-                set_download_progress(progress, StatusPhase::UploadingMedia).await;
-                bot.send_media_group(msg.chat.id, photos).await?;
-            }
-        }
-        if skipped_files > 0 {
+    if skipped_files > 0 {
+        if media.files.len() == 1 && skipped_files == 1 {
+            send_file_too_large_notice(bot, msg, largest_skipped_size).await?;
+        } else {
             send_files_too_large_notice(bot, msg, skipped_files, largest_skipped_size).await?;
         }
+    }
+
+    Ok(())
+}
+
+async fn send_delivery_photos(
+    bot: &Bot,
+    msg: &Message,
+    photos: &[&str],
+    progress: Option<&DownloadProgress<'_>>,
+) -> ResponseResult<()> {
+    match photos {
+        [] => {}
+        [photo] => {
+            set_download_progress(progress, StatusPhase::UploadingMedia).await;
+            bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(*photo)))
+                .await?;
+        }
+        photos => {
+            let photos: Vec<InputMedia> = photos
+                .iter()
+                .map(|file| {
+                    InputMedia::Photo(InputMediaPhoto::new(InputFile::file(PathBuf::from(*file))))
+                })
+                .collect();
+            set_download_progress(progress, StatusPhase::UploadingMedia).await;
+            bot.send_media_group(msg.chat.id, photos).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_delivery_file(
+    bot: &Bot,
+    msg: &Message,
+    file: &str,
+    progress: Option<&DownloadProgress<'_>>,
+) -> ResponseResult<()> {
+    set_download_progress(progress, StatusPhase::UploadingMedia).await;
+    if is_image_path(file) {
+        bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(file)))
+            .await?;
+    } else if is_gif_path(file) {
+        bot.send_animation(msg.chat.id, InputFile::file(PathBuf::from(file)))
+            .await?;
+    } else {
+        let mut request = bot.send_video(msg.chat.id, InputFile::file(PathBuf::from(file)));
+        request = request.supports_streaming(true);
+        if let Some(metadata) = probe_telegram_video_metadata(Path::new(file)).await {
+            request = request
+                .width(metadata.width)
+                .height(metadata.height)
+                .duration(metadata.duration_seconds);
+        }
+        request.await?;
+        info!(
+            "telegram processed video sent chat_id={} message_id={} file={}",
+            msg.chat.id.0, msg.id.0, file
+        );
     }
 
     Ok(())
@@ -1627,6 +1646,10 @@ fn is_image_path(path: &str) -> bool {
         || path.ends_with(".jpeg")
         || path.ends_with(".png")
         || path.ends_with(".webp")
+}
+
+fn is_gif_path(path: &str) -> bool {
+    path.ends_with(".gif")
 }
 
 async fn download_instagram_embed_images_if_needed(
@@ -2179,7 +2202,7 @@ fn item_dir_has_deliverable_files(item_dir: &Utf8PathBuf) -> Result<bool> {
         let path = entry?.path();
         if matches!(
             path.extension().and_then(|ext| ext.to_str()),
-            Some("mp4" | "jpg" | "jpeg" | "png" | "webp")
+            Some("mp4" | "gif" | "jpg" | "jpeg" | "png" | "webp")
         ) {
             return Ok(true);
         }
@@ -2496,7 +2519,7 @@ async fn collect_delivery_files(
     for entry in fs::read_dir(item_dir)? {
         let path = entry?.path();
         match path.extension().and_then(|ext| ext.to_str()) {
-            Some("mp4") => video_files.push(path),
+            Some("mp4" | "gif") => video_files.push(path),
             Some("m4a") => audio_files.push(path),
             Some("jpg" | "jpeg" | "png" | "webp") => image_files.push(path),
             _ => {}
@@ -2508,10 +2531,19 @@ async fn collect_delivery_files(
     image_files.sort();
 
     if let Some(video_path) = video_files.first() {
+        let preserve_original_gif = video_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"));
         let normalized =
             normalize_video_for_delivery(video_path, audio_files.first(), progress).await?;
         let renamed = rename_delivery_file(&normalized, filename_metadata, None)?;
-        return Ok(vec![renamed.to_string_lossy().to_string()]);
+        let mut files = vec![renamed.to_string_lossy().to_string()];
+        if preserve_original_gif {
+            let original = rename_delivery_file(video_path, filename_metadata, None)?;
+            files.push(original.to_string_lossy().to_string());
+        }
+        return Ok(files);
     }
 
     let total_images = image_files.len();
@@ -4307,6 +4339,19 @@ mod tests {
         assert!(
             telegram_target_video_bitrate_bps(1800.0, TELEGRAM_REENCODE_AUDIO_BITRATE_BPS).is_err()
         );
+    }
+
+    #[test]
+    fn gif_files_count_as_deliverable_downloads() {
+        let dir = std::env::temp_dir().join(format!("notnotsavebot-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let dir = Utf8PathBuf::from_path_buf(dir).unwrap();
+
+        assert!(!item_dir_has_deliverable_files(&dir).unwrap());
+        fs::write(dir.join("external.gif"), b"gif").unwrap();
+        assert!(item_dir_has_deliverable_files(&dir).unwrap());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
