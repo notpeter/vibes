@@ -933,14 +933,7 @@ async fn run_telegram(config: Arc<Config>) -> Result<()> {
                 };
                 let user_id = from.id.0.to_string();
                 let username = normalize_telegram_username(from.username.as_deref());
-                info!(
-                    "telegram message received chat_id={} message_id={} user_id={} username={} text={:?}",
-                    msg.chat.id.0,
-                    msg.id.0,
-                    user_id,
-                    username.as_deref().unwrap_or("-"),
-                    preview_log_text(text)
-                );
+                log_telegram_message_incoming(&msg, text);
                 let role = match authorize_user(
                     config.as_ref(),
                     "telegram",
@@ -949,8 +942,8 @@ async fn run_telegram(config: Arc<Config>) -> Result<()> {
                 ) {
                     Ok(role) => role,
                     Err(e) => {
-                        bot.send_message(msg.chat.id, format!("Authorization check failed: {e:#}"))
-                            .await?;
+                        let text = format!("Authorization check failed: {e:#}");
+                        send_telegram_text(&bot, &msg, text).await?;
                         return respond(());
                     }
                 };
@@ -972,8 +965,9 @@ async fn run_telegram(config: Arc<Config>) -> Result<()> {
                             )
                             .await?;
                         } else if text.trim_start().starts_with('/') {
-                            bot.send_message(
-                                msg.chat.id,
+                            send_telegram_text(
+                                &bot,
+                                &msg,
                                 "Unknown command. Use /help to see supported commands.",
                             )
                             .await?;
@@ -994,8 +988,9 @@ async fn run_telegram(config: Arc<Config>) -> Result<()> {
                             )
                             .await?;
                         } else if text.trim_start().starts_with('/') {
-                            bot.send_message(
-                                msg.chat.id,
+                            send_telegram_text(
+                                &bot,
+                                &msg,
                                 "Unknown command. Use /help to see supported commands.",
                             )
                             .await?;
@@ -1063,18 +1058,13 @@ async fn handle_admin_telegram_command(
                 "You can also use /download <url> explicitly.\n",
                 "Use /help to see the available commands."
             );
-            bot.send_message(msg.chat.id, text).await?;
+            send_telegram_text(bot, msg, text).await?;
         }
         AdminTelegramCommand::Help => {
-            bot.send_message(
-                msg.chat.id,
-                AdminTelegramCommand::descriptions().to_string(),
-            )
-            .await?;
+            send_telegram_text(bot, msg, AdminTelegramCommand::descriptions().to_string()).await?;
         }
         AdminTelegramCommand::Id => {
-            bot.send_message(msg.chat.id, format!("Your Telegram user id is {user_id}."))
-                .await?;
+            send_telegram_text(bot, msg, format!("Your Telegram user id is {user_id}.")).await?;
         }
         AdminTelegramCommand::Download(url) => {
             handle_download_request(bot, msg, config, &url).await?;
@@ -1101,15 +1091,13 @@ async fn handle_user_telegram_command(
                 "You can also use /download <url> explicitly.\n",
                 "Use /help to see the available commands."
             );
-            bot.send_message(msg.chat.id, text).await?;
+            send_telegram_text(bot, msg, text).await?;
         }
         UserTelegramCommand::Help => {
-            bot.send_message(msg.chat.id, UserTelegramCommand::descriptions().to_string())
-                .await?;
+            send_telegram_text(bot, msg, UserTelegramCommand::descriptions().to_string()).await?;
         }
         UserTelegramCommand::Id => {
-            bot.send_message(msg.chat.id, format!("Your Telegram user id is {user_id}."))
-                .await?;
+            send_telegram_text(bot, msg, format!("Your Telegram user id is {user_id}.")).await?;
         }
         UserTelegramCommand::Download(url) => {
             handle_download_request(bot, msg, config, &url).await?;
@@ -1125,13 +1113,14 @@ async fn send_authorize_prompt(bot: &Bot, msg: &Message) -> ResponseResult<()> {
         "Use /authorize 123456789 to authorize by numeric Telegram user id.\n",
         "Use /authorize @username to authorize by username before they message the bot."
     );
-    bot.send_message(msg.chat.id, text).await?;
+    send_telegram_text(bot, msg, text).await?;
     Ok(())
 }
 
 async fn send_download_prompt(bot: &Bot, msg: &Message) -> ResponseResult<()> {
-    bot.send_message(
-        msg.chat.id,
+    send_telegram_text(
+        bot,
+        msg,
         "Send /download <url> or paste a post URL directly.",
     )
     .await?;
@@ -1147,19 +1136,17 @@ async fn handle_authorize_request(
     let target = match parse_authorization_target(target) {
         Ok(target) => target,
         Err(e) => {
-            bot.send_message(msg.chat.id, format!("Invalid /authorize target: {e:#}"))
-                .await?;
+            send_telegram_text(bot, msg, format!("Invalid /authorize target: {e:#}")).await?;
             return Ok(());
         }
     };
 
     match authorize_telegram_target(config, &target) {
         Ok(summary) => {
-            bot.send_message(msg.chat.id, summary).await?;
+            send_telegram_text(bot, msg, summary).await?;
         }
         Err(e) => {
-            bot.send_message(msg.chat.id, format!("Authorize failed: {e:#}"))
-                .await?;
+            send_telegram_text(bot, msg, format!("Authorize failed: {e:#}")).await?;
         }
     }
 
@@ -1231,9 +1218,7 @@ async fn handle_download_request(
     config: &Config,
     input: &str,
 ) -> ResponseResult<()> {
-    let status = bot
-        .send_message(msg.chat.id, StatusPhase::FetchingLink.label())
-        .await?;
+    let status = send_telegram_text(bot, msg, StatusPhase::FetchingLink.label()).await?;
     let progress = DownloadProgress::new(bot, &status);
 
     let download = download_media(config, input, Some(&progress)).await;
@@ -1264,8 +1249,7 @@ async fn handle_download_request(
             if !progress.has_failure_phase() {
                 progress.set_phase(StatusPhase::DownloadFailed).await;
             }
-            bot.send_message(msg.chat.id, format!("Download failed: {e:#}"))
-                .await?;
+            send_telegram_text(bot, msg, format!("Download failed: {e:#}")).await?;
         }
     }
 
@@ -1278,25 +1262,24 @@ async fn send_download_result(
     media: DownloadResponse,
     progress: Option<&DownloadProgress<'_>>,
 ) -> ResponseResult<()> {
-    bot.send_message(
-        msg.chat.id,
-        format_post_text_html(
-            &media.post_platform,
-            media.post_title.as_deref(),
-            &media.post_source,
-            &media.post_date,
-            &media.post_body,
-        ),
-    )
-    .parse_mode(ParseMode::Html)
-    .link_preview_options(LinkPreviewOptions {
-        is_disabled: true,
-        url: None,
-        prefer_small_media: false,
-        prefer_large_media: false,
-        show_above_text: false,
-    })
-    .await?;
+    let text = format_post_text_html(
+        &media.post_platform,
+        media.post_title.as_deref(),
+        &media.post_source,
+        &media.post_date,
+        &media.post_body,
+    );
+    bot.send_message(msg.chat.id, text.clone())
+        .parse_mode(ParseMode::Html)
+        .link_preview_options(LinkPreviewOptions {
+            is_disabled: true,
+            url: None,
+            prefer_small_media: false,
+            prefer_large_media: false,
+            show_above_text: false,
+        })
+        .await?;
+    log_telegram_message_outgoing_text(msg, &text);
     let mut deliverable_files = Vec::new();
     let mut skipped_files = 0;
     let mut largest_skipped_size = 0;
@@ -1345,16 +1328,20 @@ async fn send_delivery_photos(
             set_download_progress(progress, StatusPhase::UploadingMedia).await;
             bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(*photo)))
                 .await?;
+            log_telegram_message_outgoing_file(msg, photo);
         }
-        photos => {
-            let photos: Vec<InputMedia> = photos
+        files => {
+            let media: Vec<InputMedia> = files
                 .iter()
                 .map(|file| {
                     InputMedia::Photo(InputMediaPhoto::new(InputFile::file(PathBuf::from(*file))))
                 })
                 .collect();
             set_download_progress(progress, StatusPhase::UploadingMedia).await;
-            bot.send_media_group(msg.chat.id, photos).await?;
+            bot.send_media_group(msg.chat.id, media).await?;
+            for file in files {
+                log_telegram_message_outgoing_file(msg, file);
+            }
         }
     }
 
@@ -1371,9 +1358,11 @@ async fn send_delivery_file(
     if is_image_path(file) {
         bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(file)))
             .await?;
+        log_telegram_message_outgoing_file(msg, file);
     } else if is_gif_path(file) {
         bot.send_animation(msg.chat.id, InputFile::file(PathBuf::from(file)))
             .await?;
+        log_telegram_message_outgoing_file(msg, file);
     } else {
         let mut request = bot.send_video(msg.chat.id, InputFile::file(PathBuf::from(file)));
         request = request.supports_streaming(true);
@@ -1384,10 +1373,7 @@ async fn send_delivery_file(
                 .duration(metadata.duration_seconds);
         }
         request.await?;
-        info!(
-            "telegram processed video sent chat_id={} message_id={} file={}",
-            msg.chat.id.0, msg.id.0, file
-        );
+        log_telegram_message_outgoing_file(msg, file);
     }
 
     Ok(())
@@ -1406,7 +1392,7 @@ async fn send_delivery_error_notice(
         "Something went wrong while sending the downloaded media. Please try again later."
             .to_string()
     };
-    bot.send_message(msg.chat.id, text).await?;
+    send_telegram_text(bot, msg, text).await?;
     Ok(())
 }
 
@@ -1420,8 +1406,9 @@ fn oversized_telegram_file_size(path: &str) -> std::io::Result<Option<u64>> {
 }
 
 async fn send_file_too_large_notice(bot: &Bot, msg: &Message, size: u64) -> ResponseResult<()> {
-    bot.send_message(
-        msg.chat.id,
+    send_telegram_text(
+        bot,
+        msg,
         format!(
             "The downloaded file is {}, which is over Telegram's {TELEGRAM_UPLOAD_LIMIT_LABEL} bot upload limit, so I did not send it.",
             format_file_size(size)
@@ -1442,8 +1429,9 @@ async fn send_files_too_large_notice(
     } else {
         "files were"
     };
-    bot.send_message(
-        msg.chat.id,
+    send_telegram_text(
+        bot,
+        msg,
         format!(
             "{skipped_files} downloaded {noun} over Telegram's {TELEGRAM_UPLOAD_LIMIT_LABEL} bot upload limit and were not sent. The largest was {}.",
             format_file_size(largest_size)
@@ -1468,6 +1456,64 @@ fn preview_log_text(input: &str) -> String {
         preview.push(ch);
     }
     preview
+}
+
+async fn send_telegram_text(
+    bot: &Bot,
+    msg: &Message,
+    text: impl Into<String>,
+) -> ResponseResult<Message> {
+    let text = text.into();
+    let sent = bot.send_message(msg.chat.id, text.clone()).await?;
+    log_telegram_message_outgoing_text(msg, &text);
+    Ok(sent)
+}
+
+fn log_telegram_message_incoming(msg: &Message, text: &str) {
+    info!(
+        "telegram message incoming chat_id={} message_id={} user_id={} username={} text={:?}",
+        msg.chat.id.0,
+        msg.id.0,
+        telegram_user_id(msg),
+        telegram_username(msg),
+        preview_log_text(text)
+    );
+}
+
+fn log_telegram_message_outgoing_text(msg: &Message, text: &str) {
+    info!(
+        "telegram message outgoing chat_id={} message_id={} user_id={} username={} text={:?}",
+        msg.chat.id.0,
+        msg.id.0,
+        telegram_user_id(msg),
+        telegram_username(msg),
+        preview_log_text(text)
+    );
+}
+
+fn log_telegram_message_outgoing_file(msg: &Message, file: &str) {
+    info!(
+        "telegram message outgoing chat_id={} message_id={} user_id={} username={} file={}",
+        msg.chat.id.0,
+        msg.id.0,
+        telegram_user_id(msg),
+        telegram_username(msg),
+        file
+    );
+}
+
+fn telegram_user_id(msg: &Message) -> String {
+    msg.from
+        .as_ref()
+        .map(|from| from.id.0.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn telegram_username(msg: &Message) -> String {
+    msg.from
+        .as_ref()
+        .and_then(|from| normalize_telegram_username(from.username.as_deref()))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn format_post_text_html(
