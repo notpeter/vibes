@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -524,6 +524,7 @@ fn ensure_runtime_tools() -> Result<()> {
         "required tool `yt-dlp` was not found on PATH; install it or fix the bot service PATH",
     )?;
     info!("found yt-dlp at {}", yt_dlp.display());
+    update_yt_dlp(&yt_dlp);
 
     let ffmpeg = which("ffmpeg").context(
         "required tool `ffmpeg` was not found on PATH; install it or fix the bot service PATH",
@@ -531,6 +532,39 @@ fn ensure_runtime_tools() -> Result<()> {
     info!("found ffmpeg at {}", ffmpeg.display());
 
     Ok(())
+}
+
+fn update_yt_dlp(yt_dlp: &Path) {
+    match Command::new(yt_dlp).arg("--update").output() {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let message = first_non_empty_line(&stdout).or_else(|| first_non_empty_line(&stderr));
+
+            if let Some(message) = message {
+                info!("yt-dlp update check completed: {}", message);
+            } else {
+                info!("yt-dlp update check completed");
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let message = first_non_empty_line(&stderr)
+                .or_else(|| first_non_empty_line(&stdout))
+                .unwrap_or("no output");
+
+            warn!(
+                "yt-dlp update check failed with status {}: {}",
+                output.status, message
+            );
+        }
+        Err(err) => warn!("failed to run yt-dlp update check: {}", err),
+    }
+}
+
+fn first_non_empty_line(output: &str) -> Option<&str> {
+    output.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 fn run_config_command(config_path: &Utf8PathBuf, command: ConfigSubcommand) -> Result<()> {
