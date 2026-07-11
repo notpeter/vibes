@@ -1,0 +1,6 @@
+name=Arrow Illusion
+author=vibes
+description=Stripes drift at a constant rate; crank the arrows to make them appear to reverse.
+bundleID=com.vibes.arrowillusion
+version=1.0
+buildNumber=1
