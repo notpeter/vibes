@@ -470,8 +470,10 @@ const TELEGRAM_COPY_AUDIO_MAX_BITRATE_BPS: u64 = 131_000;
 const TELEGRAM_REENCODE_CONTAINER_OVERHEAD_BPS: u64 = 64_000;
 const TELEGRAM_REENCODE_MIN_VIDEO_BITRATE_BPS: u64 = 150_000;
 const TELEGRAM_UPLOAD_LIMIT_LABEL: &str = "50 MB";
+const TELEGRAM_MEDIA_GROUP_LIMIT: usize = 10;
 const PROGRESS_BAR_WIDTH: usize = 20;
 const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(5);
+const TIKTOK_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone)]
 enum AuthorizationTarget {
@@ -1331,16 +1333,30 @@ async fn send_delivery_photos(
             log_telegram_message_outgoing_file(msg, photo);
         }
         files => {
-            let media: Vec<InputMedia> = files
-                .iter()
-                .map(|file| {
-                    InputMedia::Photo(InputMediaPhoto::new(InputFile::file(PathBuf::from(*file))))
-                })
-                .collect();
-            set_download_progress(progress, StatusPhase::UploadingMedia).await;
-            bot.send_media_group(msg.chat.id, media).await?;
-            for file in files {
-                log_telegram_message_outgoing_file(msg, file);
+            for chunk in files.chunks(TELEGRAM_MEDIA_GROUP_LIMIT) {
+                match chunk {
+                    [photo] => {
+                        set_download_progress(progress, StatusPhase::UploadingMedia).await;
+                        bot.send_photo(msg.chat.id, InputFile::file(PathBuf::from(*photo)))
+                            .await?;
+                        log_telegram_message_outgoing_file(msg, photo);
+                    }
+                    photos => {
+                        let media: Vec<InputMedia> = photos
+                            .iter()
+                            .map(|file| {
+                                InputMedia::Photo(InputMediaPhoto::new(InputFile::file(
+                                    PathBuf::from(*file),
+                                )))
+                            })
+                            .collect();
+                        set_download_progress(progress, StatusPhase::UploadingMedia).await;
+                        bot.send_media_group(msg.chat.id, media).await?;
+                        for file in photos {
+                            log_telegram_message_outgoing_file(msg, file);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1664,6 +1680,10 @@ async fn download_media(
     let download_ms = started.elapsed().as_millis() as i64;
 
     let normalize_started = Instant::now();
+    if let Err(err) = download_tiktok_images_if_needed(&normalized, &item_dir).await {
+        set_download_progress(progress, StatusPhase::FetchFailed).await;
+        return Err(err);
+    }
     if let Err(err) = download_instagram_embed_images_if_needed(&normalized, &item_dir).await {
         set_download_progress(progress, StatusPhase::FetchFailed).await;
         return Err(err);
@@ -1730,6 +1750,160 @@ fn is_image_path(path: &str) -> bool {
 
 fn is_gif_path(path: &str) -> bool {
     path.ends_with(".gif")
+}
+
+async fn download_tiktok_images_if_needed(normalized: &str, item_dir: &Utf8PathBuf) -> Result<()> {
+    if item_dir_has_video_files(item_dir)? {
+        return Ok(());
+    }
+
+    let info = read_info_json(item_dir).unwrap_or(Value::Null);
+    if read_platform_name(&info) != "TikTok" && !is_tiktok_url(normalized) {
+        return Ok(());
+    }
+
+    let tiktok_url = read_string_field(&info, &["webpage_url", "original_url"])
+        .or_else(|| tiktok_video_url_from_photo_url(normalized).ok().flatten())
+        .unwrap_or_else(|| normalized.to_string());
+    let client = reqwest::Client::builder()
+        .user_agent(TIKTOK_USER_AGENT)
+        .build()?;
+    let html = client
+        .get(&tiktok_url)
+        .header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-us,en;q=0.5")
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let image_urls = extract_tiktok_image_urls_from_html(&html);
+    if image_urls.is_empty() {
+        return Ok(());
+    }
+
+    remove_tiktok_cover_thumbnails(item_dir)?;
+    for (index, image_url) in image_urls.iter().enumerate() {
+        let response = client
+            .get(image_url)
+            .header(reqwest::header::REFERER, &tiktok_url)
+            .send()
+            .await?
+            .error_for_status()?;
+        if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE)
+            && !content_type
+                .to_str()
+                .unwrap_or_default()
+                .starts_with("image/")
+        {
+            bail!(
+                "TikTok image URL returned non-image content type: {}",
+                content_type.to_str().unwrap_or("<invalid content type>")
+            );
+        }
+        let extension = image_extension_from_url(image_url);
+        let output_path = item_dir.join(format!("tiktok-image-{:02}.{extension}", index + 1));
+        fs::write(output_path, response.bytes().await?)?;
+    }
+
+    Ok(())
+}
+
+fn item_dir_has_video_files(item_dir: &Utf8PathBuf) -> Result<bool> {
+    for entry in fs::read_dir(item_dir)? {
+        let path = entry?.path();
+        if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("mp4" | "gif")
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn remove_tiktok_cover_thumbnails(item_dir: &Utf8PathBuf) -> Result<()> {
+    for entry in fs::read_dir(item_dir)? {
+        let path = entry?.path();
+        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if !matches!(extension, "jpg" | "jpeg" | "png" | "webp") {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if !filename.starts_with("tiktok-image-") {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_tiktok_image_urls_from_html(html: &str) -> Vec<String> {
+    let Some(payload) = extract_script_json(html, "__UNIVERSAL_DATA_FOR_REHYDRATION__") else {
+        return Vec::new();
+    };
+    let Ok(state) = serde_json::from_str::<Value>(payload) else {
+        return Vec::new();
+    };
+    let Some(images) = state
+        .pointer("/__DEFAULT_SCOPE__/webapp.video-detail/itemInfo/itemStruct/imagePost/images")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut urls = Vec::new();
+    for image in images {
+        let Some(url) = image
+            .pointer("/imageURL/urlList")
+            .and_then(Value::as_array)
+            .and_then(|url_list| {
+                url_list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find(|url| is_tiktok_photo_image_url(url))
+            })
+        else {
+            continue;
+        };
+        if !urls.iter().any(|existing| existing == url) {
+            urls.push(url.to_string());
+        }
+    }
+    urls
+}
+
+fn extract_script_json<'a>(html: &'a str, script_id: &str) -> Option<&'a str> {
+    let marker = format!(r#"<script id="{script_id}" type="application/json">"#);
+    let start = html.find(&marker)? + marker.len();
+    let rest = &html[start..];
+    let end = rest.find("</script>")?;
+    Some(&rest[..end])
+}
+
+fn is_tiktok_photo_image_url(url: &str) -> bool {
+    Url::parse(url).ok().is_some_and(|url| {
+        url.host_str().is_some_and(|host| {
+            host.ends_with("tiktokcdn-us.com")
+                || host.ends_with("tiktokcdn.com")
+                || host.ends_with("ttcdn-us.com")
+        }) && url.path().contains("photomode")
+            && matches!(
+                url.path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .and_then(|filename| filename.rsplit_once('.'))
+                    .map(|(_, extension)| extension.to_ascii_lowercase())
+                    .as_deref(),
+                Some("jpg" | "jpeg" | "png" | "webp")
+            )
+    })
 }
 
 async fn download_instagram_embed_images_if_needed(
@@ -3431,11 +3605,13 @@ async fn run_yt_dlp_download(
     out_tmpl: &Utf8PathBuf,
     progress: Option<&DownloadProgress<'_>>,
 ) -> Result<std::process::Output> {
+    let tiktok_photo_video_url = tiktok_video_url_from_photo_url(normalized)?;
+    let download_url = tiktok_photo_video_url.unwrap_or_else(|| normalized.to_string());
     let preferred = spawn_yt_dlp_download(
-        normalized,
+        &download_url,
         out_tmpl,
         Some("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"),
-        yt_dlp_format_sort(normalized),
+        yt_dlp_format_sort(&download_url),
         progress,
     )
     .await?;
@@ -3444,12 +3620,83 @@ async fn run_yt_dlp_download(
     }
 
     let stderr = String::from_utf8_lossy(&preferred.stderr);
+    if let Some(tiktok_video_url) = tiktok_video_url_from_unsupported_photo_error(&stderr) {
+        warn!(
+            "yt-dlp does not support TikTok photo URL directly; retrying as video URL: {}",
+            tiktok_video_url
+        );
+        let fallback = spawn_yt_dlp_download(
+            &tiktok_video_url,
+            out_tmpl,
+            Some("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"),
+            yt_dlp_format_sort(&tiktok_video_url),
+            progress,
+        )
+        .await?;
+        return Ok(fallback);
+    }
     if should_retry_without_video_format(&stderr) {
-        let fallback = spawn_yt_dlp_download(normalized, out_tmpl, None, None, progress).await?;
+        let fallback = spawn_yt_dlp_download(&download_url, out_tmpl, None, None, progress).await?;
         return Ok(fallback);
     }
 
     Ok(preferred)
+}
+
+fn tiktok_video_url_from_unsupported_photo_error(stderr: &str) -> Option<String> {
+    const MARKER: &str = "Unsupported URL:";
+
+    stderr.lines().find_map(|line| {
+        let url = line.split_once(MARKER)?.1.trim();
+        tiktok_video_url_from_photo_url(url).ok().flatten()
+    })
+}
+
+fn tiktok_video_url_from_photo_url(input: &str) -> Result<Option<String>> {
+    let mut url = Url::parse(input)?;
+    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    if !matches!(host.as_str(), "tiktok.com" | "www.tiktok.com") {
+        return Ok(None);
+    }
+
+    let segments = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let [handle, "photo", item_id, ..] = segments.as_slice() else {
+        return Ok(None);
+    };
+    if !handle.starts_with('@') || item_id.is_empty() {
+        return Ok(None);
+    }
+    let handle = (*handle).to_string();
+    let item_id = (*item_id).to_string();
+
+    url.set_query(None);
+    url.set_fragment(None);
+    {
+        let mut output_segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("unable to rewrite TikTok photo URL"))?;
+        output_segments.clear();
+        output_segments.push(&handle);
+        output_segments.push("video");
+        output_segments.push(&item_id);
+    }
+    Ok(Some(url.to_string()))
+}
+
+fn is_tiktok_url(input: &str) -> bool {
+    Url::parse(input).ok().is_some_and(|url| {
+        url.host_str().is_some_and(|host| {
+            matches!(
+                host.to_ascii_lowercase().as_str(),
+                "tiktok.com" | "www.tiktok.com"
+            )
+        })
+    })
 }
 
 fn yt_dlp_format_sort(normalized: &str) -> Option<&'static str> {
@@ -3493,15 +3740,16 @@ async fn spawn_yt_dlp_download(
         cmd.arg("-S").arg(format_sort);
     }
 
-    let mut child = cmd
-        .arg("--newline")
+    cmd.arg("--newline")
         .arg("--progress")
         .arg("--progress-delta")
         .arg("1")
         .arg("--write-info-json")
         .arg("--write-description")
         .arg("--convert-thumbnails")
-        .arg("jpg")
+        .arg("jpg");
+
+    let mut child = cmd
         .arg("--output")
         .arg(out_tmpl.as_str())
         .arg(normalized)
@@ -4237,6 +4485,99 @@ mod tests {
             normalize_input_url("x.com/notpeter/status/123?ref=ignored").unwrap(),
             "https://x.com/notpeter/status/123"
         );
+    }
+
+    #[test]
+    fn rewrites_tiktok_photo_urls_as_video_urls_for_ytdlp() {
+        assert_eq!(
+            tiktok_video_url_from_photo_url(
+                "https://www.tiktok.com/@wehavethedata/photo/7664719388565572877?_r=1&_t=x"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("https://www.tiktok.com/@wehavethedata/video/7664719388565572877")
+        );
+        assert_eq!(
+            tiktok_video_url_from_photo_url(
+                "https://www.example.com/@wehavethedata/photo/7664719388565572877"
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn extracts_tiktok_photo_retry_url_from_ytdlp_error() {
+        assert_eq!(
+            tiktok_video_url_from_unsupported_photo_error(
+                "WARNING: [generic] Falling back on generic information extractor\nERROR: Unsupported URL: https://www.tiktok.com/@wehavethedata/photo/7664719388565572877?_r=1&_t=ZP-98CnXvbcCHH"
+            )
+            .as_deref(),
+            Some("https://www.tiktok.com/@wehavethedata/video/7664719388565572877")
+        );
+        assert_eq!(
+            tiktok_video_url_from_unsupported_photo_error(
+                "ERROR: Unsupported URL: https://example.com/photo/7664719388565572877"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn extracts_all_tiktok_photo_mode_image_urls() {
+        let mut images = Vec::new();
+        for index in 1..=11 {
+            images.push(serde_json::json!({
+                "imageURL": {"urlList": [
+                    format!("https://p16-common-sign.tiktokcdn-us.com/tos-useast5-i-photomode-tx/image-{index:02}~tplv-photomode-image.jpeg?x=1"),
+                    format!("https://p19-common-sign.tiktokcdn-us.com/tos-useast5-i-photomode-tx/image-{index:02}~tplv-photomode-image.jpeg?x=1")
+                ]},
+                "imageWidth": 1156,
+                "imageHeight": 1448
+            }));
+        }
+        let payload = serde_json::json!({
+            "__DEFAULT_SCOPE__": {
+                "webapp.video-detail": {
+                    "itemInfo": {
+                        "itemStruct": {
+                            "imagePost": {"images": images}
+                        }
+                    }
+                }
+            }
+        });
+        let html = format!(
+            r#"<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">{payload}</script>"#
+        );
+
+        let urls = extract_tiktok_image_urls_from_html(&html);
+        assert_eq!(urls.len(), 11);
+        assert_eq!(
+            urls.first().map(String::as_str),
+            Some(
+                "https://p16-common-sign.tiktokcdn-us.com/tos-useast5-i-photomode-tx/image-01~tplv-photomode-image.jpeg?x=1"
+            )
+        );
+        assert_eq!(
+            urls.last().map(String::as_str),
+            Some(
+                "https://p16-common-sign.tiktokcdn-us.com/tos-useast5-i-photomode-tx/image-11~tplv-photomode-image.jpeg?x=1"
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_non_tiktok_photo_image_urls() {
+        assert!(is_tiktok_photo_image_url(
+            "https://p16-common-sign.tiktokcdn-us.com/tos-useast5-i-photomode-tx/image.jpeg?x=1"
+        ));
+        assert!(!is_tiktok_photo_image_url(
+            "https://p16-common-sign.tiktokcdn-us.com/tos-useast5-i-video-tx/image.jpeg?x=1"
+        ));
+        assert!(!is_tiktok_photo_image_url(
+            "https://example.com/tos-useast5-i-photomode-tx/image.jpeg?x=1"
+        ));
     }
 
     #[test]
