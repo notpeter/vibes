@@ -19,6 +19,20 @@ Rust Telegram bot for fetching social post media using `yt-dlp`.
 - `yt-dlp` available on `$PATH`
 - `ffmpeg` available on `$PATH`
 
+### Install `yt-dlp`
+
+On x86-64 Linux, install the full `yt-dlp_linux` build so browser
+impersonation is available for sites such as TikTok. The plain `yt-dlp` Unix
+zipapp does not include the required `curl_cffi` dependency.
+
+```bash
+mkdir -p "$HOME/.local/bin"
+curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
+  -o /tmp/yt-dlp_linux
+chmod +x /tmp/yt-dlp_linux
+install -m 0755 /tmp/yt-dlp_linux "$HOME/.local/bin/yt-dlp"
+```
+
 ## Run
 
 ```bash
